@@ -1,0 +1,151 @@
+package etcd
+
+import (
+	"bufio"
+	"context"
+	"io"
+	"os/exec"
+	"time"
+
+	"mocknet/plugins/kubernetes"
+	"mocknet/plugins/server/rpctest"
+
+	clientv3 "go.etcd.io/etcd/client/v3"
+	"go.ligato.io/cn-infra/v2/logging"
+)
+
+type Plugin struct {
+	Deps
+
+	PluginName   string
+	K8sNamespace string
+	EtcdClient   *clientv3.Client
+}
+
+type Deps struct {
+	Kubernetes *kubernetes.Plugin
+	Log        logging.PluginLogger
+}
+
+func (p *Plugin) Init() error {
+	if p.Deps.Log == nil {
+		p.Deps.Log = logging.ForPlugin(p.String())
+	}
+
+	go func() {
+		// prepare etcd binary file, make sure the relative position of etcd.sh
+		cmd := exec.Command("bash", "./../scripts/etcd.sh") // 以当前命令行路径为准，当前路径为contiv-agent
+		output, err := cmd.StdoutPipe()
+		if err != nil {
+			p.Log.Errorln(err)
+			panic(err)
+		}
+
+		if err := cmd.Start(); err != nil {
+			p.Log.Errorln(err)
+			panic(err)
+		} else {
+			p.Log.Infoln("successfully setup and start etcd!")
+		}
+
+		reader := bufio.NewReader(output)
+
+		var contentArray = make([]string, 0, 5)
+		var index int
+		contentArray = contentArray[0:0]
+
+		for {
+			line, err2 := reader.ReadString('\n')
+			if err2 != nil || io.EOF == err2 {
+				break
+			}
+			p.Log.Infoln(line)
+			index++
+			contentArray = append(contentArray, line)
+		}
+	}()
+
+	if client, err := clientv3.New(clientv3.Config{
+		Endpoints:   []string{"0.0.0.0:12380"},
+		DialTimeout: 5 * time.Second,
+	}); err != nil {
+		p.Log.Errorln(err)
+		panic(err)
+	} else {
+		p.EtcdClient = client
+		p.Log.Infoln("successfully connected to etcd!")
+	}
+
+	// 读取key-value操作
+	/*
+		kvc := clientv3.NewKV(p.EtcdClient)
+		rootContext := context.Background()
+		ctx2, cancelFunc2 := context.WithTimeout(rootContext, time.Duration(2)*time.Second)
+		_, err := kvc.Put(ctx2, "cc", "pengyang")
+		cancelFunc2()
+		if err != nil {
+			p.Log.Errorln(err)
+		}
+
+		ctx, cancelFunc := context.WithTimeout(rootContext, time.Duration(2)*time.Second)
+		response, err := kvc.Get(ctx, "cc")
+		cancelFunc()
+		if err != nil {
+			p.Log.Errorln(err)
+		}
+		kvs := response.Kvs
+		p.Log.Infoln(err)
+		p.Log.Infoln("last value is :%s\r\n", string(kvs[0].Value))
+	*/
+
+	return nil
+}
+
+func (p *Plugin) String() string {
+	return "etcd"
+}
+
+func (p *Plugin) Close() error {
+	return nil
+}
+
+func (p *Plugin) Commit_Create_Info(message rpctest.Message) error {
+	links := message.Command.EmunetCreation.Emunet.Links
+
+	ctx := context.Background()
+	kvc := clientv3.NewKV(p.EtcdClient)
+	txn := kvc.Txn(ctx)
+
+	ops := []clientv3.Op{}
+	for _, link := range links {
+		value := ""
+		value = value + "node1: " + link.Node1.Name + ", "
+		value = value + "node2: " + link.Node2.Name + ", "
+		value = value + "node1_inf: " + link.Node1Inf + ", "
+		value = value + "node2_inf: " + link.Node2Inf
+
+		ops = append(ops, clientv3.OpPut("link/"+link.Name, value))
+	}
+
+	txn.Then(ops...)
+
+	_, err := txn.Commit()
+	if err != nil {
+		p.Log.Errorln(err)
+		panic(err)
+	} else {
+		p.Log.Infoln("successfully commit data to master etcd")
+	}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), time.Duration(2)*time.Second)
+	response, err := kvc.Get(ctx, "link", clientv3.WithPrefix())
+	cancelFunc()
+	if err != nil {
+		p.Log.Errorln(err)
+	}
+	kvs := response.Kvs
+	p.Log.Infoln(err)
+	p.Log.Infoln("the value of pengyang is :%s\r\n", kvs)
+
+	return nil
+}
