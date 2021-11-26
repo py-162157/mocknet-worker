@@ -10,7 +10,7 @@ import (
 
 func main() {
 	config := clientv3.Config{
-		Endpoints:   []string{"192.168.122.101:22379"},
+		Endpoints:   []string{"0.0.0.0:32379"},
 		DialTimeout: 10 * time.Second,
 	}
 	client, err := clientv3.New(config)
@@ -60,5 +60,7 @@ func main() {
 	_, err = kvs.Put(context.Background(), "/vnf-agent/mocknet-pod-h1/config/vpp/v2/interfaces/memif3", "{\"name\":\"memif3\",\"type\":\"MEMIF\",\"enabled\":true,\"memif\":{\"id\":1,\"socket_filename\":\"/run/vpp/memif.sock\"}}")
 	if err != nil {
 		panic(err)
+	} else {
+		fmt.Println("successfully put a value to etcd")
 	}
 }

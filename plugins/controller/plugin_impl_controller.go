@@ -1,15 +1,16 @@
 package controller
 
 import (
+	"bufio"
 	"context"
+	"io"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path"
 	"strconv"
 	"strings"
 	"time"
-
-	//"mocknet/plugins/server/rpctest"
 
 	"mocknet/plugins/vpp"
 
@@ -18,13 +19,11 @@ import (
 )
 
 var (
-	TIMEOUT             = time.Duration(3) * time.Second // 超时
-	MASTER_IP_ADDRESS   = "192.168.122.100"
-	LOCAL_IP_ADDRESS    = "192.168.122.101"
-	ETCD_PORT           = "22379"
-	MASTER_ETCD_ADDRESS = []string{MASTER_IP_ADDRESS + ":" + ETCD_PORT}
-	LOCAL_ETCD_ADDRESS  = []string{LOCAL_IP_ADDRESS + ":" + ETCD_PORT}
-	vxlan_instance      = 0
+	TIMEOUT              = time.Duration(3) * time.Second // 超时
+	ETCD_ADDRESS         = "0.0.0.0:32379"
+	vxlan_instance       = 0
+	POD_VPP_CONFIG_FILE  = "/etc/vpp/vpp.conf"
+	HOST_VPP_CONFIG_FILE = "/etc/vpp/startup.conf"
 )
 
 type Plugin struct {
@@ -33,7 +32,6 @@ type Plugin struct {
 	PluginName       string
 	K8sNamespace     string
 	MasterEtcdClient *clientv3.Client
-	LocalEtcdClient  *clientv3.Client
 }
 
 type Deps struct {
@@ -54,17 +52,16 @@ type Deps struct {
 	Addresses       DepAdress
 	// key: interface name (podname-interfaceid)
 	// value: interface id in host-side vpp
-	IntToVppId map[string]uint32
+	IntToVppId    map[string]uint32
+	LocalHostName string
 
 	Log logging.PluginLogger
 }
 
 type DepAdress struct {
-	master_ip_address   string
-	local_ip_address    string
-	local_vtep_address  string
-	master_etcd_address []string
-	local_etcd_address  []string
+	master_ip_address  string
+	local_ip_address   string
+	local_vtep_address string
 }
 
 type Nodeinfo struct {
@@ -107,6 +104,9 @@ func (p *Plugin) Init() error {
 		p.Deps.Log = logging.ForPlugin(p.String())
 	}
 
+	p.pod_vpp_core_bind()
+	//p.host_vpp_core_bind()
+
 	p.DirPrefix = "/var/run/mocknet/"
 	p.create_work_directory(p.DirPrefix)
 
@@ -125,7 +125,9 @@ func (p *Plugin) Init() error {
 
 	// connect to master-etcd client
 	config := clientv3.Config{
-		Endpoints:   MASTER_ETCD_ADDRESS,
+		Endpoints: []string{
+			ETCD_ADDRESS,
+		},
 		DialTimeout: 10 * time.Second,
 	}
 	client, err := clientv3.New(config)
@@ -133,23 +135,17 @@ func (p *Plugin) Init() error {
 		panic(err)
 	} else {
 		p.MasterEtcdClient = client
-		p.Log.Infoln("successfully create new etcd client!")
+		p.Log.Infoln("successfully connected to master etcd")
 	}
 
-	// connect with local etcd
-	if client, err := clientv3.New(clientv3.Config{
-		Endpoints:   LOCAL_ETCD_ADDRESS,
-		DialTimeout: 5 * time.Second,
-	}); err != nil {
-		p.Log.Errorln(err)
+	if local_hostname, err := os.Hostname(); err != nil {
 		panic(err)
 	} else {
-		p.LocalEtcdClient = client
-		p.Log.Infoln("successfully connected to local etcd!")
+		p.LocalHostName = local_hostname
 	}
 
-	local_hostname, err := os.Hostname()
-	p.get_node_infos(local_hostname)
+	p.get_node_infos(p.LocalHostName)
+	p.generate_etcd_config()
 
 	go p.watch_topology(context.Background())
 	go p.watch_pods_info(context.Background())
@@ -170,11 +166,58 @@ func (p *Plugin) Close() error {
 func (p *Plugin) create_work_directory(dir string) error {
 	_, err := os.Stat(p.DirPrefix)
 	if err == nil {
-		panic(err)
+		p.Log.Infoln("work path '/var/run/mocknet/' already exist, no need to create again")
+		return nil
 	}
 	if os.IsNotExist(err) {
 		os.MkdirAll(p.DirPrefix, 0777)
 	}
+	return nil
+}
+
+func (p *Plugin) generate_etcd_config() error {
+	ip_cmd := `NODE_IP="$(ifconfig -a|grep inet|grep -v 127.0.0.1|grep -v inet6|grep 192|awk '{print $2}'|tr -d "addr:"​)"
+
+	if [ ! -d "/opt/etcd" ]; then
+		mkdir /opt/etcd
+		cd /opt/etcd
+		touch etcd.conf
+		chmod 777 etcd.conf
+		echo "insecure-transport: true" >> etcd.conf
+		echo "dial-timeout: 10000000000" >> etcd.conf
+		echo "allow-delayed-start: true" >> etcd.conf
+		echo "endpoints:" >> etcd.conf
+		echo "  - "${NODE_IP}:32379"" >> etcd.conf
+	fi`
+	cmd := exec.Command("bash", "-c", ip_cmd)
+	output, err := cmd.StdoutPipe()
+	if err != nil {
+		p.Log.Errorln(err)
+		panic(err)
+	}
+
+	if err := cmd.Start(); err != nil {
+		p.Log.Errorln(err)
+		panic(err)
+	}
+	reader := bufio.NewReader(output)
+
+	var contentArray = make([]string, 0, 5)
+	var index int
+	contentArray = contentArray[0:0]
+
+	for {
+		line, err2 := reader.ReadString('\n')
+		if err2 != nil || io.EOF == err2 {
+			break
+		}
+		p.Log.Infoln(line)
+		index++
+		contentArray = append(contentArray, line)
+	}
+
+	p.Log.Infoln("successfully set etcd.conf!")
+
 	return nil
 }
 
@@ -193,6 +236,8 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 
 	for {
 		select {
+		case <-time.After(3 * time.Second):
+			p.inform_finished("ParseTopologyInfo")
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
@@ -204,7 +249,6 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 				if ev.IsCreate() {
 					p.translate(*ev)
 					p.topology_make()
-					p.inform_finished("ParseTopologyInfo")
 				} else if ev.IsModify() {
 
 				} else if ev.Type == 1 { // 1 present DELETE
@@ -272,11 +316,11 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 					panic(err)
 				}
 				if p.ReadyCount < creation_count {
-
+					p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
 					// pod-side config
 					for _, pod := range p.MocknetTopology.pods {
 						if p.Is_Local(pod.name) {
-							p.Log.Infoln("pod", pod.name, "is local")
+							p.Log.Infoln("pod", pod.name, "is local, start to config it")
 							// create memif socket
 							p.assign_dir_to_pod(pod.name)
 							id := p.get_socket_id(pod.name) + 1
@@ -286,8 +330,6 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 
 							// create memif interface
 							pod.alloc_interface_id()
-
-							p.Log.Infoln("pod.infs =", pod.infs)
 
 							for _, vpp_id := range pod.infs {
 								// host-side
@@ -368,10 +410,14 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 						}
 					}
 
+					// host-side vpp config
 					for _, link := range p.MocknetTopology.links {
 						if p.Is_Local(link.pod1) && p.Is_Local(link.pod2) {
+							// for both locals, xconnect them together
 							p.Vpp.XConnect(p.IntToVppId[link.pod1+"-"+link.pod1inf], p.IntToVppId[link.pod2+"-"+link.pod2inf])
+
 						} else if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
+							// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
 							src_address := p.Addresses.local_vtep_address
 							dst_address := p.Nodeinfos[p.PodInfos[link.pod2].hostname].vtepip
 							vni := uint32(link.vni)
@@ -384,14 +430,6 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 						}
 					}
 
-					// host-side vpp config
-					// create vxlan tunnel and xconnect it with memif interface
-					/*for memif_id, _ := range p.InterfaceIDName {
-						// take memif interface id as tunnel vni
-						vxlan_id := p.Vpp.Create_Vxlan_Tunnel(VXLAN_SRC_ADDRESS, VXLAN_DST_ADDRESS, memif_id, memif_id)
-						p.Vpp.XConnect(vxlan_id, memif_id)
-						p.Vpp.XConnect(memif_id, vxlan_id)
-					}*/
 					// readycount + 1
 					p.ReadyCount++
 				}
@@ -405,6 +443,8 @@ func (p *Plugin) watch_pods_info(ctx context.Context) error {
 
 	for {
 		select {
+		case <-time.After(3 * time.Second):
+			p.inform_finished("ParsePodsInfo")
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
@@ -414,19 +454,11 @@ func (p *Plugin) watch_pods_info(ctx context.Context) error {
 			}
 			for _, ev := range resp.Events {
 				if ev.IsCreate() {
-					if string(ev.Kv.Value) == "done" {
-						p.inform_finished("ParsePodsInfo")
-					} else {
-						parse_result := parse_pod_info(*ev)
-						p.PodInfos[parse_result.name] = parse_result
-					}
+					parse_result := parse_pod_info(*ev)
+					p.PodInfos[parse_result.name] = parse_result
 				} else if ev.IsModify() {
-					if string(ev.Kv.Value) == "done" {
-						p.inform_finished("ParsePodsInfo")
-					} else {
-						parse_result := parse_pod_info(*ev)
-						p.PodInfos[parse_result.name] = parse_result
-					}
+					parse_result := parse_pod_info(*ev)
+					p.PodInfos[parse_result.name] = parse_result
 				} else if ev.Type == 1 { // 1 present DELETE
 					pod_name := strings.Split(string(ev.Kv.Key), "/")[2]
 					delete(p.PodInfos, pod_name)
@@ -500,7 +532,7 @@ func (p *Plugin) translate(event clientv3.Event) error {
 }
 
 func (p *Plugin) Is_Local(name string) bool {
-	if p.PodInfos[name].hostip == LOCAL_IP_ADDRESS {
+	if p.PodInfos[name].hostip == p.Addresses.local_ip_address {
 		return true
 	} else {
 		return false
@@ -538,7 +570,7 @@ func (pod Pod) alloc_interface_id() error {
 func (p *Plugin) Create_Podside_Interface(podname string, name string, id string) error {
 	key := "/vnf-agent/" + "mocknet-pod-" + podname + "/config/vpp/v2/interfaces/memif" + id
 	value := "{\"name\":\"" + name + "\",\"type\":\"MEMIF\",\"enabled\":true,\"memif\":{\"id\":" + id + ",\"socket_filename\":\"/run/vpp/memif.sock\"}}"
-	kv := clientv3.NewKV(p.LocalEtcdClient)
+	kv := clientv3.NewKV(p.MasterEtcdClient)
 
 	_, err := kv.Put(context.Background(), key, value)
 	if err != nil {
@@ -562,8 +594,8 @@ func (p *Plugin) clear_socket() error {
 }
 
 func (p *Plugin) get_node_infos(local_hostname string) error {
-	p.Log.Infoln("waiting for data from master")
-	kv := clientv3.NewKV(p.LocalEtcdClient)
+	p.Log.Infoln("waiting for node data from master")
+	kv := clientv3.NewKV(p.MasterEtcdClient)
 	var resp *clientv3.GetResponse
 	for {
 		temp, err := kv.Get(context.Background(), "/mocknet/nodeinfo/", clientv3.WithPrefix())
@@ -588,13 +620,11 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 		if name == local_hostname {
 			p.Addresses.local_ip_address = nodeip
 			p.Addresses.local_vtep_address = vtepip
-			p.Addresses.local_etcd_address = []string{nodeip + ":" + ETCD_PORT}
 			p.Vpp.Set_interface_state_up(1)
 			p.Log.Infoln(vtepip)
 			p.Vpp.Set_Interface_Ip(1, vtepip, 24)
 		} else if name == "master" {
 			p.Addresses.master_ip_address = nodeip
-			p.Addresses.master_etcd_address = []string{nodeip + ":" + ETCD_PORT}
 		}
 
 	}
@@ -614,5 +644,129 @@ func (p *Plugin) vxlan_info_operation(link Link) error {
 
 	}
 
+	return nil
+}
+
+func (p *Plugin) pod_vpp_core_bind() error {
+	// automaticly bind vpp main thread and worker thread to cpu cores
+	vppconf :=
+		`
+	unix {
+		nodaemon
+		cli-listen 0.0.0.0:5002
+		cli-no-pager
+		log /tmp/vpp.log
+		full-coredump
+	}
+	plugins {
+		plugin dpdk_plugin.so {
+			disable
+		}
+	}
+	api-trace {
+		on
+	}
+	socksvr {
+		socket-name /run/vpp/api.sock
+	}
+	statseg {
+		socket-name /run/vpp/stats.sock
+		per-node-counters on
+	}
+
+	cpu {
+		skip-cores 1
+		scheduler-policy fifo
+		scheduler-priority 50
+	}
+`
+	_, err := os.Stat(POD_VPP_CONFIG_FILE)
+	if err == nil {
+		os.Remove(POD_VPP_CONFIG_FILE)
+	}
+	f, err := os.Create(POD_VPP_CONFIG_FILE)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	if err != nil {
+		panic(err)
+	} else {
+		_, err = f.Write([]byte(vppconf))
+		if err != nil {
+			panic(err)
+		} else {
+			p.Log.Infoln("created pod vpp config file")
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) host_vpp_core_bind() error {
+	vppconf :=
+		`
+unix {
+	nodaemon
+	log /var/log/vpp/vpp.log
+	full-coredump
+	cli-listen /run/vpp/cli.sock
+	gid vpp
+  }
+  
+  api-trace {
+	on
+  }
+  
+  api-segment {
+	gid vpp
+  }
+  
+  socksvr {
+	default
+  }
+  
+  cpu {
+	skip-cores 1
+	workers 1
+	scheduler-policy fifo
+	scheduler-priority 50
+  }
+`
+	_, err := os.Stat(HOST_VPP_CONFIG_FILE)
+	if err == nil {
+		os.Remove(HOST_VPP_CONFIG_FILE)
+	}
+	f, err := os.Create(HOST_VPP_CONFIG_FILE)
+	if err != nil {
+		panic(err)
+	}
+	defer f.Close()
+	if err != nil {
+		panic(err)
+	} else {
+		_, err = f.Write([]byte(vppconf))
+		if err != nil {
+			panic(err)
+		} else {
+			p.Log.Infoln("created host vpp config file")
+		}
+	}
+
+	/*	cmd :=
+				`service vpp restart
+		while true
+		do
+			OUTPUT="$(service vpp status | grep active)"
+			if [ -z "$OUTPUT" ];then
+				echo "waiting for vpp service to restart"
+				sleep 1
+			else
+				break 1
+			fi
+		done
+		`
+
+			restart_cmd := exec.Command("bash", "-c", cmd)
+			restart_cmd.Run()*/
 	return nil
 }

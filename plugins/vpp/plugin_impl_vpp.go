@@ -101,7 +101,6 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) {
 		SocketID:       id,
 		SocketFilename: filename,
 	}
-	p.Log.Infoln(req)
 	reply := &memif_2106.MemifSocketFilenameAddDelReply{}
 
 	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
@@ -134,7 +133,7 @@ func (p *Plugin) CreateMemifInterface(role_string string, id uint32, socket_id u
 		panic(err)
 	}
 
-	p.Log.Infoln("successfully created interface:", id, socket_id, role_string)
+	p.Log.Infoln("successfully created interface id:", id, "socket-id:", socket_id, "role:", role_string)
 	return uint32(reply.SwIfIndex)
 }
 
@@ -360,7 +359,6 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip string, mask_len uint8) erro
 
 	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
 		p.Log.Errorln("failed to set interface address")
-		panic(err)
 	}
 
 	p.Log.Infoln("successfully set interface address")

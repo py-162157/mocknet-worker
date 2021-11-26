@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"mocknet/plugins/controller"
-	"mocknet/plugins/etcd"
 	"mocknet/plugins/vpp"
 
 	"go.ligato.io/cn-infra/v2/agent"
@@ -21,7 +20,6 @@ type MocknetAgent struct {
 	name       string
 	LogManager *logmanager.Plugin
 
-	ETCD       *etcd.Plugin
 	VPP        *vpp.Plugin
 	Controller *controller.Plugin
 }
@@ -49,13 +47,9 @@ func main() {
 		deps.Vpp = VppPlugin
 	}))
 
-	EtcdPlugin := etcd.NewPlugin(etcd.UseDeps(func(deps *etcd.Deps) {
-	}))
-
 	mocknetAgent := &MocknetAgent{
 		name:       "mocknetagent",
 		LogManager: LogmanagerPlugin,
-		ETCD:       EtcdPlugin,
 		VPP:        VppPlugin,
 		Controller: ControllerPlugin,
 	}

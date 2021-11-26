@@ -39,6 +39,7 @@ import (
 	interfaces_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface"
 	interface_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface_types"
 	ip_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip_types"
+	memif_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/memif"
 	vxlan_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/vxlan"
 )
 
@@ -91,14 +92,14 @@ func main() {
 	//ipAddressDump(ch)
 
 	//interfaceNotifications(ch)
-	//CreateSocket(ch)
+	CreateSocket(ch)
 	//CreateMemifInterface(ch)
 	//interface_state(ch)
 	//create_vxlan_tunnel(ch)
 	//get_interfaces(ch)
 	//xconnect(ch)
 	//vxlan(ch)
-	Set_Interface_Ip(ch)
+	//Set_Interface_Ip(ch)
 
 	if err := ch.CheckCompatiblity(vxlan_2106.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
@@ -131,15 +132,15 @@ func cleanString(str string) string {
 	return strings.Split(str, "\x00")[0]
 }
 
-/*func CreateSocket(ch api.Channel) {
+func CreateSocket(ch api.Channel) {
 	fmt.Println("Creating memif socket")
 
-	req := &memif.MemifSocketFilenameAddDel{
+	req := &memif_2106.MemifSocketFilenameAddDel{
 		IsAdd:          true,
 		SocketID:       5,
 		SocketFilename: "/home/ubuntu/test.sock",
 	}
-	reply := &memif.MemifSocketFilenameAddDelReply{}
+	reply := &memif_2106.MemifSocketFilenameAddDelReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		fmt.Println(err, "error creating memif socket")
@@ -150,7 +151,7 @@ func cleanString(str string) string {
 	fmt.Printf("memif socket index: %v\n", reply.Retval)
 	fmt.Println("OK")
 
-}*/
+}
 
 /*func CreateMemifInterface(ch api.Channel) {
 	fmt.Println("Creating memif inerface")
