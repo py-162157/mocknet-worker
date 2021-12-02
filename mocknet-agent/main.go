@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"mocknet/plugins/controller"
+	"mocknet/plugins/linux"
 	"mocknet/plugins/vpp"
 
 	"go.ligato.io/cn-infra/v2/agent"
@@ -43,8 +44,12 @@ func main() {
 	VppPlugin := vpp.NewPlugin(vpp.UseDeps(func(deps *vpp.Deps) {
 	}))
 
+	LinuxPlugin := linux.NewPlugin(linux.UseDeps(func(deps *linux.Deps) {
+	}))
+
 	ControllerPlugin := controller.NewPlugin(controller.UseDeps(func(deps *controller.Deps) {
 		deps.Vpp = VppPlugin
+		deps.Linux = LinuxPlugin
 	}))
 
 	mocknetAgent := &MocknetAgent{

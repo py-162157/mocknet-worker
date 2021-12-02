@@ -20,11 +20,14 @@ import (
 	interface_types_2009 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2009/interface_types"
 	l2_2009 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2009/l2"
 
+	fib_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/fib_types"
 	interfaces_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface"
 	interface_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface_types"
+	ip_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip"
 	ip_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip_types"
 	l2_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/l2"
 	memif_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/memif"
+	tap_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/tapv2"
 	vxlan_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/vxlan"
 )
 
@@ -33,6 +36,20 @@ const SOCKET_NAME = "memif.sock"
 var (
 	sockAddr = flag.String("sock", socketclient.DefaultSocketName, "Path to VPP binary API socket file")
 	pod_sock = "/var/run/mocknet/"
+)
+
+const (
+	// NextHopViaLabelUnset constant has to be assigned into the field next hop
+	// via label in ip_add_del_route binary message if next hop via label is not defined.
+	// Equals to MPLS_LABEL_INVALID defined in VPP
+	NextHopViaLabelUnset uint32 = 0xfffff + 1
+
+	// ClassifyTableIndexUnset is a default value for field classify_table_index in ip_add_del_route binary message.
+	ClassifyTableIndexUnset = ^uint32(0)
+
+	// NextHopOutgoingIfUnset constant has to be assigned into the field next_hop_outgoing_interface
+	// in ip_add_del_route binary message if outgoing interface for next hop is not defined.
+	NextHopOutgoingIfUnset = ^uint32(0)
 )
 
 type Plugin struct {
@@ -326,17 +343,7 @@ func (p *Plugin) Pod_Bridge(pod_name string, ints_id []uint32, bridge_id uint32)
 	return nil
 }
 
-func (p *Plugin) Set_Interface_Ip(int_id uint32, ip string, mask_len uint8) error {
-	ip_addr := strings.Split(ip, ".")
-	ip_addr_slice := make([]uint8, 4)
-	for i := 0; i < 4; i++ {
-		conv, err := strconv.Atoi(ip_addr[i])
-		if err != nil {
-			panic("error parsing dst ip address string to int")
-		}
-		ip_addr_slice[i] = uint8(conv)
-	}
-
+func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) error {
 	req := &interfaces_2106.SwInterfaceAddDelAddress{
 		SwIfIndex: interface_types_2106.InterfaceIndex(int_id),
 		IsAdd:     true,
@@ -344,14 +351,9 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip string, mask_len uint8) erro
 			ip_types_2106.Prefix{
 				Address: ip_types_2106.Address{
 					Af: 0,
-					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
-						ip_addr_slice[0],
-						ip_addr_slice[1],
-						ip_addr_slice[2],
-						ip_addr_slice[3],
-					}),
+					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(ip.parse_ipv4_address())),
 				},
-				Len: mask_len,
+				Len: uint8(ip.Mask),
 			},
 		),
 	}
@@ -362,6 +364,97 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip string, mask_len uint8) erro
 	}
 
 	p.Log.Infoln("successfully set interface address")
+
+	return nil
+}
+
+func (p *Plugin) Create_Tap() error {
+	req := &tap_2106.TapCreateV2{
+		ID: 0,
+	}
+	reply := &tap_2106.TapCreateV2Reply{}
+
+	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+		p.Log.Errorln("failed to create tap interface")
+	}
+
+	p.Log.Infoln("successfully created tap interface")
+
+	return nil
+}
+
+type Route_Info struct {
+	Dst   IpNet
+	Gw    IpNet
+	Dev   string
+	DevId uint32
+}
+
+type IpNet struct {
+	Ip   string
+	Mask uint
+}
+
+func (ip IpNet) parse_ipv4_address() [4]uint8 {
+	ip_addr := strings.Split(ip.Ip, ".")
+	ip_addr_slice := make([]uint8, 4)
+	for i := 0; i < 4; i++ {
+		conv, err := strconv.Atoi(ip_addr[i])
+		if err != nil {
+			panic("error parsing dst ip address string to int")
+		}
+		ip_addr_slice[i] = uint8(conv)
+	}
+	return [4]uint8{
+		ip_addr_slice[0],
+		ip_addr_slice[1],
+		ip_addr_slice[2],
+		ip_addr_slice[3],
+	}
+}
+
+func (p *Plugin) Add_Route(route Route_Info) error {
+	req := &ip_2106.IPRouteAddDel{
+		// Multi path is always true
+		IsMultipath: true,
+		IsAdd:       true,
+	}
+
+	fibPath := fib_types_2106.FibPath{}
+
+	if route.Gw.Ip != "" {
+		fibPath.Nh = fib_types_2106.FibPathNh{
+			Address:            ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(route.Gw.parse_ipv4_address())),
+			ClassifyTableIndex: ClassifyTableIndexUnset,
+		}
+		fibPath.Proto = fib_types_2106.FIB_API_PATH_NH_PROTO_IP4
+	}
+
+	prefix := ip_types_2106.Prefix{
+		Address: ip_types_2106.Address{
+			Af: ip_types_2106.ADDRESS_IP4,
+			Un: ip_types_2106.AddressUnionIP4(route.Dst.parse_ipv4_address()),
+		},
+		Len: uint8(route.Dst.Mask),
+	}
+
+	if route.Dev != "" {
+		fibPath.SwIfIndex = route.DevId
+	}
+
+	req.Route = ip_2106.IPRoute{
+		Prefix: prefix,
+		NPaths: 1,
+		Paths:  []fib_types_2106.FibPath{fibPath},
+	}
+
+	reply := &ip_2106.IPRouteAddDelReply{}
+
+	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+		p.Log.Errorln("failed to add ip route")
+	}
+
+	p.Log.Infoln("successfully added ip route")
 
 	return nil
 }

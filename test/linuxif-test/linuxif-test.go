@@ -2,55 +2,35 @@ package main
 
 import (
 	"fmt"
+	"net"
 
-	"go.ligato.io/vpp-agent/v3/clientv2/linux/localclient"
-
-	//"go.ligato.io/vpp-agent/v3/cmd/vpp-agent/app"
-	linux_intf "go.ligato.io/vpp-agent/v3/proto/ligato/linux/interfaces"
-	vpp_intf "go.ligato.io/vpp-agent/v3/proto/ligato/vpp/interfaces"
+	"github.com/vishvananda/netlink"
 )
 
 func main() {
-	//VPP := app.DefaultVPP()
-	//Linux := app.DefaultLinux()
-	err := localclient.DataResyncRequest("linuxif_test").
-		VppInterface(initialTap1()).
-		LinuxInterface(initialLinuxTap1()).
-		Send().ReceiveReply()
+	handler, err := netlink.NewHandle()
+	if err != nil {
+		panic(err)
+	}
+	ens2, _ := netlink.LinkByName("ens2")
+	route := &netlink.Route{
+		//LinkIndex: ens2.Attrs().Index,
+		Dst: &net.IPNet{
+			IP:   net.IPv4(10, 3, 2, 0),
+			Mask: net.CIDRMask(24, 32),
+		},
+		MultiPath: []*netlink.NexthopInfo{
+			{
+				LinkIndex: ens2.Attrs().Index,
+				Gw:        net.IPv4(192, 168, 122, 100),
+			},
+		},
+		//Src: net.IPv4(192, 168, 122, 101),
+	}
+	err = handler.RouteAdd(route)
 	if err != nil {
 		fmt.Println(err)
 	} else {
-		fmt.Println("successfully create tap pair!")
-	}
-}
-
-func initialTap1() *vpp_intf.Interface {
-	return &vpp_intf.Interface{
-		Name:    "tap1",
-		Type:    vpp_intf.Interface_TAP,
-		Enabled: true,
-		Link: &vpp_intf.Interface_Tap{
-			Tap: &vpp_intf.TapLink{
-				Version: 2,
-			},
-		},
-	}
-}
-
-func initialLinuxTap1() *linux_intf.Interface {
-	return &linux_intf.Interface{
-		Name:        "linux-tap1",
-		Type:        linux_intf.Interface_TAP_TO_VPP,
-		Enabled:     true,
-		PhysAddress: "88:88:88:88:88:88",
-		IpAddresses: []string{
-			"10.0.0.2/24",
-		},
-		HostIfName: "tap_to_vpp1",
-		Link: &linux_intf.Interface_Tap{
-			Tap: &linux_intf.TapLink{
-				VppTapIfName: "tap1",
-			},
-		},
+		fmt.Println("successfully add a route to linux namespace!")
 	}
 }

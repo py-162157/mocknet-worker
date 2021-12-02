@@ -4,7 +4,6 @@ go 1.16
 
 require (
 	git.fd.io/govpp.git v0.3.6-0.20210810100027-c0da1f2999a6
-	github.com/eapache/go-resiliency v1.1.0 // indirect
 	github.com/fluent/fluent-logger-golang v1.4.0 // indirect
 	github.com/googleapis/gnostic v0.2.0 // indirect
 	github.com/imdario/mergo v0.3.7 // indirect
@@ -20,7 +19,7 @@ require (
 	k8s.io/api v0.17.1
 	k8s.io/apimachinery v0.22.2
 	k8s.io/client-go v11.0.0+incompatible
-
+	github.com/vishvananda/netlink v1.1.0
 )
 
 replace (

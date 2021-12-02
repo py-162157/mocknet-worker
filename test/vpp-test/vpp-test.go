@@ -36,8 +36,10 @@ import (
 	//"git.fd.io/govpp.git/binapi/vxlan"
 	"git.fd.io/govpp.git/core"
 	l2_2009 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2009/l2"
+	fib_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/fib_types"
 	interfaces_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface"
 	interface_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface_types"
+	ip_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip"
 	ip_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip_types"
 	memif_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/memif"
 	vxlan_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/vxlan"
@@ -92,7 +94,7 @@ func main() {
 	//ipAddressDump(ch)
 
 	//interfaceNotifications(ch)
-	CreateSocket(ch)
+	//CreateSocket(ch)
 	//CreateMemifInterface(ch)
 	//interface_state(ch)
 	//create_vxlan_tunnel(ch)
@@ -100,6 +102,7 @@ func main() {
 	//xconnect(ch)
 	//vxlan(ch)
 	//Set_Interface_Ip(ch)
+	Add_Route(ch)
 
 	if err := ch.CheckCompatiblity(vxlan_2106.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
@@ -308,6 +311,46 @@ func Set_Interface_Ip(ch api.Channel) error {
 	}
 
 	fmt.Println("successfully set interface address")
+
+	return nil
+}
+
+func Add_Route(ch api.Channel) error {
+	req := &ip_2106.IPRouteAddDel{
+		IsAdd:       true,
+		IsMultipath: true,
+		Route: ip_2106.IPRoute{
+			Prefix: ip_types_2106.Prefix{
+				Address: ip_types_2106.Address{
+					Af: ip_types_2106.ADDRESS_IP4,
+					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(
+						[4]uint8{5, 5, 5, 5},
+					)),
+				},
+				Len: 24,
+			},
+			NPaths: 1,
+			Paths: []fib_types_2106.FibPath{
+				{
+					SwIfIndex: 2,
+					Proto:     fib_types_2106.FIB_API_PATH_NH_PROTO_IP4,
+					Nh: fib_types_2106.FibPathNh{
+						Address: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(
+							[4]uint8{192, 168, 122, 101},
+						)),
+					},
+				},
+			},
+		},
+	}
+	reply := &ip_2106.IPRouteAddDelReply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to add route")
+		panic(err)
+	}
+
+	fmt.Println("successfully added route")
 
 	return nil
 }

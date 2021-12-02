@@ -1,9 +1,7 @@
 package controller
 
 import (
-	"bufio"
 	"context"
-	"io"
 	"io/ioutil"
 	"os"
 	"os/exec"
@@ -12,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"mocknet/plugins/linux"
 	"mocknet/plugins/vpp"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
@@ -36,6 +35,7 @@ type Plugin struct {
 
 type Deps struct {
 	Vpp             *vpp.Plugin
+	Linux           *linux.Plugin
 	MocknetTopology NetTopo
 	PodInfos        map[string]podinfo
 	Nodeinfos       map[string]Nodeinfo
@@ -175,7 +175,7 @@ func (p *Plugin) create_work_directory(dir string) error {
 	return nil
 }
 
-func (p *Plugin) generate_etcd_config() error {
+func (p Plugin) generate_etcd_config() error {
 	ip_cmd := `NODE_IP="$(ifconfig -a|grep inet|grep -v 127.0.0.1|grep -v inet6|grep 192|awk '{print $2}'|tr -d "addr:"​)"
 
 	if [ ! -d "/opt/etcd" ]; then
@@ -190,31 +190,7 @@ func (p *Plugin) generate_etcd_config() error {
 		echo "  - "${NODE_IP}:32379"" >> etcd.conf
 	fi`
 	cmd := exec.Command("bash", "-c", ip_cmd)
-	output, err := cmd.StdoutPipe()
-	if err != nil {
-		p.Log.Errorln(err)
-		panic(err)
-	}
-
-	if err := cmd.Start(); err != nil {
-		p.Log.Errorln(err)
-		panic(err)
-	}
-	reader := bufio.NewReader(output)
-
-	var contentArray = make([]string, 0, 5)
-	var index int
-	contentArray = contentArray[0:0]
-
-	for {
-		line, err2 := reader.ReadString('\n')
-		if err2 != nil || io.EOF == err2 {
-			break
-		}
-		p.Log.Infoln(line)
-		index++
-		contentArray = append(contentArray, line)
-	}
+	cmd.Run()
 
 	p.Log.Infoln("successfully set etcd.conf!")
 
@@ -607,6 +583,8 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 			break
 		}
 	}
+
+	// to find local host infos
 	for _, nodekv := range resp.Kvs {
 		split_value := strings.Split(string(nodekv.Value), ",")
 		name := strings.Split(split_value[0], ":")[1]
@@ -620,13 +598,44 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 		if name == local_hostname {
 			p.Addresses.local_ip_address = nodeip
 			p.Addresses.local_vtep_address = vtepip
-			p.Vpp.Set_interface_state_up(1)
-			p.Log.Infoln(vtepip)
-			p.Vpp.Set_Interface_Ip(1, vtepip, 24)
 		} else if name == "master" {
 			p.Addresses.master_ip_address = nodeip
 		}
+	}
 
+	// route from vpp namespace to local host linux namespace
+	p.Vpp.Add_Route(vpp.Route_Info{
+		Dst: vpp.IpNet{
+			Ip:   p.Addresses.local_ip_address,
+			Mask: 24,
+		},
+		Dev:   "tap0",
+		DevId: 1,
+	})
+
+	for _, nodekv := range resp.Kvs {
+		split_value := strings.Split(string(nodekv.Value), ",")
+		name := strings.Split(split_value[0], ":")[1]
+		nodeip := strings.Split(split_value[1], ":")[1]
+		vtepip := strings.Split(split_value[2], ":")[1]
+		if name == local_hostname {
+			p.Vpp.Create_Tap()
+			p.Vpp.Set_interface_state_up(1)
+			p.Vpp.Set_Interface_Ip(1, vpp.IpNet{
+				Ip:   vtepip,
+				Mask: 24,
+			})
+		} else if name != "master" {
+			p.Vpp.Add_Route(vpp.Route_Info{
+				Dst: vpp.IpNet{
+					Ip:   vtepip,
+					Mask: 32,
+				},
+				Gw: vpp.IpNet{
+					Ip: nodeip,
+				},
+			})
+		}
 	}
 
 	return nil
@@ -675,9 +684,8 @@ func (p *Plugin) pod_vpp_core_bind() error {
 	}
 
 	cpu {
-		skip-cores 1
-		scheduler-policy fifo
-		scheduler-priority 50
+		main-core 2
+		corelist-workers 3
 	}
 `
 	_, err := os.Stat(POD_VPP_CONFIG_FILE)
