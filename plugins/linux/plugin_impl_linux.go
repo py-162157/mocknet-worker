@@ -17,7 +17,8 @@ type Plugin struct {
 }
 
 type Deps struct {
-	Log logging.PluginLogger
+	Log             logging.PluginLogger
+	HostMainDevName string
 }
 
 func (p *Plugin) Init() error {
@@ -31,6 +32,8 @@ func (p *Plugin) Init() error {
 		p.LinuxHandler = new_handler
 	}
 	p.PluginName = "linux"
+
+	p.get_host_main_net_dev()
 
 	return nil
 }
@@ -57,14 +60,16 @@ type IpNet struct {
 	Mask uint
 }
 
-func (p *Plugin) AddRoute(route Route_Info) error {
+func (p *Plugin) Add_Route(route Route_Info) error {
+	//p.Log.Infoln("dst:", route.Dst, "gw:", route.Gw, "dev:", route.Dev)
 	req := &netlink.Route{
 		Dst:       route.Dst.IpNetToStd(),
 		MultiPath: []*netlink.NexthopInfo{{}},
 	}
 
 	if route.Gw.Ip != "" {
-		req.MultiPath[0].Gw = route.Dst.IpNetToStd().IP
+		req.MultiPath[0].Gw = route.Gw.IpNetToStd().IP
+		req.Gw = route.Gw.IpNetToStd().IP
 	}
 
 	if route.Dev != "" {
@@ -78,11 +83,30 @@ func (p *Plugin) AddRoute(route Route_Info) error {
 
 	err := p.LinuxHandler.RouteAdd(req)
 	if err != nil {
-		p.Log.Errorln(err)
-		panic(err)
+		if err.Error() == "file exists" {
+			p.Log.Warningln("route already exist, so automaticly delete it and retry again")
+			p.Del_Route(route)
+			p.Add_Route(route)
+		} else {
+			panic(err)
+		}
 	} else {
 		p.Log.Infoln("successfully add a route to linux namespace!")
 	}
+
+	return nil
+}
+
+func (p *Plugin) Del_Route(route Route_Info) error {
+	err := p.LinuxHandler.RouteDel(&netlink.Route{
+		Dst: route.Dst.IpNetToStd(),
+	})
+	if err != nil {
+		p.Log.Errorln("delete route failed")
+		panic(err)
+	}
+	p.Log.Infoln("delete route for destination", route.Dst.Ip)
+
 	return nil
 }
 
@@ -126,5 +150,18 @@ func (mynet IpNet) IpNetToStd() *net.IPNet {
 			mask[2],
 			mask[3],
 		),
+	}
+}
+
+func (p *Plugin) get_host_main_net_dev() {
+	devs, err := p.LinuxHandler.LinkList()
+	if err != nil {
+		panic(err)
+	}
+	for _, dev := range devs {
+		if string([]byte(dev.Attrs().Name)[:1]) == "e" {
+			p.HostMainDevName = dev.Attrs().Name
+			break
+		}
 	}
 }

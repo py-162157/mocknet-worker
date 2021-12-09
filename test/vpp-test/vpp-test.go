@@ -34,20 +34,22 @@ import (
 	//"git.fd.io/govpp.git/binapi/memif"
 
 	//"git.fd.io/govpp.git/binapi/vxlan"
+	l2_2009 "mocknet/binapi/vpp2009/l2"
+	tap_2009 "mocknet/binapi/vpp2009/tapv2"
+	fib_types_2110 "mocknet/binapi/vpp2110/fib_types"
+	interfaces_2110 "mocknet/binapi/vpp2110/interface"
+	interface_types_2110 "mocknet/binapi/vpp2110/interface_types"
+	ip_2110 "mocknet/binapi/vpp2110/ip"
+	ip_types_2110 "mocknet/binapi/vpp2110/ip_types"
+	memif_2110 "mocknet/binapi/vpp2110/memif"
+	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
+
 	"git.fd.io/govpp.git/core"
-	l2_2009 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2009/l2"
-	fib_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/fib_types"
-	interfaces_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface"
-	interface_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/interface_types"
-	ip_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip"
-	ip_types_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/ip_types"
-	memif_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/memif"
-	vxlan_2106 "go.ligato.io/vpp-agent/v3/plugins/vpp/binapi/vpp2106/vxlan"
 )
 
 var (
 	sockAddr = flag.String("sock", "/run/vpp/api.sock", "Path to VPP binary API socket file")
-	//sockAddr = flag.String("sock", "/var/run/mocknet/h1/api.sock", "Path to VPP binary API socket file")
+	//sockAddr = flag.String("sock", "/var/run/mocknet/h1s2/api.sock", "Path to VPP binary API socket file")
 )
 
 func main() {
@@ -102,9 +104,10 @@ func main() {
 	//xconnect(ch)
 	//vxlan(ch)
 	//Set_Interface_Ip(ch)
-	Add_Route(ch)
+	//Add_Route(ch)
+	//Create_Tap(ch)
 
-	if err := ch.CheckCompatiblity(vxlan_2106.AllMessages()...); err != nil {
+	if err := ch.CheckCompatiblity(memif_2110.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
 	} else {
 		fmt.Println("interfaces compatiblity check passed")
@@ -138,12 +141,12 @@ func cleanString(str string) string {
 func CreateSocket(ch api.Channel) {
 	fmt.Println("Creating memif socket")
 
-	req := &memif_2106.MemifSocketFilenameAddDel{
+	req := &memif_2110.MemifSocketFilenameAddDel{
 		IsAdd:          true,
 		SocketID:       5,
 		SocketFilename: "/home/ubuntu/test.sock",
 	}
-	reply := &memif_2106.MemifSocketFilenameAddDelReply{}
+	reply := &memif_2110.MemifSocketFilenameAddDelReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		fmt.Println(err, "error creating memif socket")
@@ -242,25 +245,25 @@ func pod_xconnect(ch api.Channel) {
 }
 
 func vxlan(ch api.Channel) {
-	req := &vxlan_2106.VxlanAddDelTunnel{
+	req := &vxlan_2110.VxlanAddDelTunnel{
 		IsAdd:    true,
 		Instance: 5,
-		SrcAddress: ip_types_2106.Address{
+		SrcAddress: ip_types_2110.Address{
 			Af: 0,
-			Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
 				1, 1, 1, 1,
 			}),
 		},
-		DstAddress: ip_types_2106.Address{
+		DstAddress: ip_types_2110.Address{
 			Af: 0,
-			Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
 				1, 1, 1, 2,
 			}),
 		},
 		Vni:            5,
 		DecapNextIndex: 1,
 	}
-	reply := &vxlan_2106.VxlanAddDelTunnelReply{}
+	reply := &vxlan_2110.VxlanAddDelTunnelReply{}
 	for {
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 			fmt.Println("failed to create vxlan tunnel, retry")
@@ -285,14 +288,14 @@ func Set_Interface_Ip(ch api.Channel) error {
 		ip_addr_slice[i] = uint8(conv)
 	}
 
-	req := &interfaces_2106.SwInterfaceAddDelAddress{
-		SwIfIndex: interface_types_2106.InterfaceIndex(int_id),
+	req := &interfaces_2110.SwInterfaceAddDelAddress{
+		SwIfIndex: interface_types_2110.InterfaceIndex(int_id),
 		IsAdd:     true,
-		Prefix: ip_types_2106.AddressWithPrefix(
-			ip_types_2106.Prefix{
-				Address: ip_types_2106.Address{
+		Prefix: ip_types_2110.AddressWithPrefix(
+			ip_types_2110.Prefix{
+				Address: ip_types_2110.Address{
 					Af: 0,
-					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
+					Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
 						ip_addr_slice[0],
 						ip_addr_slice[1],
 						ip_addr_slice[2],
@@ -303,7 +306,7 @@ func Set_Interface_Ip(ch api.Channel) error {
 			},
 		),
 	}
-	reply := &interfaces_2106.SwInterfaceAddDelAddressReply{}
+	reply := &interfaces_2110.SwInterfaceAddDelAddressReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		fmt.Println("failed to set interface address")
@@ -316,34 +319,34 @@ func Set_Interface_Ip(ch api.Channel) error {
 }
 
 func Add_Route(ch api.Channel) error {
-	req := &ip_2106.IPRouteAddDel{
+	req := &ip_2110.IPRouteAddDel{
 		IsAdd:       true,
 		IsMultipath: true,
-		Route: ip_2106.IPRoute{
-			Prefix: ip_types_2106.Prefix{
-				Address: ip_types_2106.Address{
-					Af: ip_types_2106.ADDRESS_IP4,
-					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(
-						[4]uint8{5, 5, 5, 5},
+		Route: ip_2110.IPRoute{
+			Prefix: ip_types_2110.Prefix{
+				Address: ip_types_2110.Address{
+					Af: ip_types_2110.ADDRESS_IP4,
+					Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(
+						[4]uint8{192, 168, 122, 102},
 					)),
 				},
-				Len: 24,
+				Len: 32,
 			},
 			NPaths: 1,
-			Paths: []fib_types_2106.FibPath{
+			Paths: []fib_types_2110.FibPath{
 				{
-					SwIfIndex: 2,
-					Proto:     fib_types_2106.FIB_API_PATH_NH_PROTO_IP4,
-					Nh: fib_types_2106.FibPathNh{
-						Address: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(
-							[4]uint8{192, 168, 122, 101},
+					SwIfIndex: 1,
+					Proto:     fib_types_2110.FIB_API_PATH_NH_PROTO_IP4,
+					Nh: fib_types_2110.FibPathNh{
+						Address: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(
+							[4]uint8{192, 168, 122, 102},
 						)),
 					},
 				},
 			},
 		},
 	}
-	reply := &ip_2106.IPRouteAddDelReply{}
+	reply := &ip_2110.IPRouteAddDelReply{}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 		fmt.Println("failed to add route")
@@ -351,6 +354,21 @@ func Add_Route(ch api.Channel) error {
 	}
 
 	fmt.Println("successfully added route")
+
+	return nil
+}
+
+func Create_Tap(ch api.Channel) error {
+	req := &tap_2009.TapCreateV2{
+		ID: 0,
+	}
+	reply := &tap_2009.TapCreateV2Reply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to create host tap interface")
+	}
+
+	fmt.Println("successfully created host tap interface")
 
 	return nil
 }

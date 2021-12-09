@@ -5,21 +5,22 @@ go 1.16
 require (
 	git.fd.io/govpp.git v0.3.6-0.20210810100027-c0da1f2999a6
 	github.com/fluent/fluent-logger-golang v1.4.0 // indirect
+	github.com/go-delve/delve v1.7.4-0.20211207172355-a4ac69e87df3 // indirect
 	github.com/googleapis/gnostic v0.2.0 // indirect
 	github.com/imdario/mergo v0.3.7 // indirect
 	github.com/tinylib/msgp v1.1.0 // indirect
 	github.com/unrolled/render v1.0.1-0.20190325150441-1ac792296fd4 // indirect
+	github.com/vishvananda/netlink v1.1.0
 	go.etcd.io/etcd/client/v3 v3.5.1
 	go.ligato.io/cn-infra/v2 v2.5.0-alpha.0.20200313154441-b0d4c1b11c73
 	go.ligato.io/vpp-agent/v3 v3.2.0
-	golang.org/x/net v0.0.0-20210825183410-e898025ed96a
+	golang.org/x/net v0.0.0-20211015210444-4f30a5c0130f
 	golang.org/x/text v0.3.7 // indirect
 	google.golang.org/grpc v1.38.0
 	google.golang.org/protobuf v1.27.1
 	k8s.io/api v0.17.1
 	k8s.io/apimachinery v0.22.2
 	k8s.io/client-go v11.0.0+incompatible
-	github.com/vishvananda/netlink v1.1.0
 )
 
 replace (

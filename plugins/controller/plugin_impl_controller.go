@@ -62,6 +62,7 @@ type DepAdress struct {
 	master_ip_address  string
 	local_ip_address   string
 	local_vtep_address string
+	host_net_addr_24   string
 }
 
 type Nodeinfo struct {
@@ -242,7 +243,7 @@ func (p *Plugin) inform_finished(event string) error {
 		panic(err)
 	}
 	kv := clientv3.NewKV(p.MasterEtcdClient)
-	kv.Put(context.Background(), "/mocknet/event/"+event+"/"+hostname, "done")
+	kv.Put(context.Background(), "/mocknet/"+event+"/"+hostname, "done")
 	return nil
 }
 
@@ -265,8 +266,7 @@ func (p *Plugin) topology_make() error {
 }
 
 func (p *Plugin) watch_transport_done(ctx context.Context) error {
-	ctx1, cancel := context.WithTimeout(context.Background(), TIMEOUT)
-	defer cancel()
+	ctx1 := context.Background()
 	var getResp *clientv3.GetResponse
 	var err error
 	getResp, err = p.MasterEtcdClient.Get(ctx1, "/mocknet/topo/ready")
@@ -292,11 +292,10 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 					panic(err)
 				}
 				if p.ReadyCount < creation_count {
-					p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
-					// pod-side config
 					for _, pod := range p.MocknetTopology.pods {
 						if p.Is_Local(pod.name) {
-							p.Log.Infoln("pod", pod.name, "is local, start to config it")
+							p.Log.Infoln("pod", pod.name, "is local, so start to config it")
+							p.Log.Infoln("----------- configuring", pod.name, "-----------")
 							// create memif socket
 							p.assign_dir_to_pod(pod.name)
 							id := p.get_socket_id(pod.name) + 1
@@ -309,7 +308,7 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 
 							for _, vpp_id := range pod.infs {
 								// host-side
-								global_id := p.Vpp.CreateMemifInterface("master", uint32(vpp_id), uint32(id))
+								global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id))
 								p.Vpp.Set_interface_state_up(global_id)
 								p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
 								p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
@@ -318,64 +317,44 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 								// pod-side
 								inf_name := "memif" + strconv.Itoa(vpp_id)
 								// int_id is the id in a socket used to identify peer(slave or master)
-								inf_id := strconv.Itoa(vpp_id)
-								p.Create_Podside_Interface(pod.name, inf_name, inf_id)
+								//inf_id := strconv.Itoa(vpp_id)
+								//p.Create_Podside_Interface(pod.name, inf_name, inf_id)
+								pod_int_id := p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
+								p.Vpp.Pod_Set_interface_state_up(pod.name, pod_int_id)
 							}
-
-							// write pod-vpp to pod pod-linux route
-							kv := clientv3.NewKV(p.MasterEtcdClient)
-							ip_address := p.PodInfos[pod.name].podip
-							key := "/vnf-agent/mocknet-pod-" + pod.name + "/config/vpp/v2/route/vrf/0/dst/" + ip_address + "/32/gw/" + ip_address
-							value := "{\"dst_network\":\"" + ip_address + "/32\",\"next_hop_addr\":\"" + ip_address + "\",\"outgoing_interface\":\"tap0\"}"
-							kv.Put(context.Background(), key, value)
 
 							// write pod-vpp-tap to pod-vpp-memif route
 							if string([]byte(pod.name)[:1]) == "h" {
+								// probe weather tap0 interface exist
+								result, tap_id := p.Vpp.Pod_Create_Tap(pod.name)
+								if result {
+									p.Vpp.Pod_Set_interface_state_up(pod.name, uint32(tap_id))
+									// recreate tap interface successfully, need to config it
+									p.MasterEtcdClient.Put(context.Background(), "/mocknet/PodTapReCofiguration-"+pod.name, pod.name)
+									p.wait_for_response("PodTapConfigFinished-" + pod.name)
+								} else {
+									tap_id = 1
+									p.Vpp.Pod_Set_interface_state_up(pod.name, 1)
+								}
 
-								/*
-									// currently, all host have only 1 interface and named "memif0/0"
-									net_address := "10.1.0.0"
-									key = "/vnf-agent/mocknet-pod-" + pod.name + "/config/vpp/v2/route/if/memif0/0/vrf/0/dst/" + net_address + "/16/gw/" + net_address
-									value = "{\"dst_network\":\"" + net_address + "/16\",\"next_hop_addr\":\"" + net_address + "\",\"outgoing_interface\":\"memif0/0\"}"
-									kv.Put(context.Background(), key, value)
-								*/
-
-								// or l2xconnect them together
-								/*
-									key = "/vnf-agent/mocknet-pod-" + pod.name + "/config/vpp/l2/v2/xconnect/tap0"
-									value = "{\"transmit_interface\":\"memif0/0\", \"receive_interface\":\"tap0\"}"
-									kv.Put(context.Background(), key, value)
-
-									key = "/vnf-agent/mocknet-pod-" + pod.name + "/config/vpp/l2/v2/xconnect/memif0/0"
-									value = "{\"transmit_interface\":\"tap0\", \"receive_interface\":\"memif0/0\"}"
-									kv.Put(context.Background(), key, value)
-								*/
-
-								// config l2xconnect by govpp
+								// write pod-vpp to pod pod-linux route
+								p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
+									Dst: vpp.IpNet{
+										Ip:   p.PodInfos[pod.name].podip,
+										Mask: 32,
+									},
+									Dev:   "tap0",
+									DevId: uint32(tap_id),
+								})
 								p.Vpp.Pod_Xconnect(pod.name, 1, 2)
 								p.Vpp.Pod_Xconnect(pod.name, 2, 1)
 
 							} else if string([]byte(pod.name)[:1]) == "s" {
-
-								// currently, set switch route as single topology in mininet in case of test
-								// in switch pod-vpp, interface name is memif0/ + id(same with id in host-vpp)
-								/*for _, link := range p.MocknetTopology.links {
-									// choose switch pod's link
-									if link.pod1 == pod.name {
-										dst_ip_address := p.PodInfos[link.pod2].podip
-										int_id := pod.infs[link.pod1inf]
-										int_name := "memif0/" + strconv.Itoa(int_id)
-										key = "/vnf-agent/mocknet-pod-" + pod.name + "/config/vpp/v2/route/vrf/0/dst/" + dst_ip_address + "/32/gw/" + dst_ip_address
-										value = "{\"dst_network\":\"" + dst_ip_address + "\",\"next_hop_addr\":\"" + dst_ip_address + "\",\"outgoing_interface\":\"" + int_name + "\"}"
-										kv.Put(context.Background(), key, value)
-									}
-								}*/
-
 								// bridge interfaces in switch pod together
 								// manually
 								ints_id := make([]uint32, 0)
 								for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
-									ints_id = append(ints_id, uint32(i+2))
+									ints_id = append(ints_id, uint32(i+1))
 								}
 								p.Vpp.Pod_Bridge(pod.name, ints_id, 1)
 
@@ -383,10 +362,12 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 								p.Log.Errorln("the judgement character is ", string([]byte(pod.name)[:1]))
 								panic("pod type judgement error!")
 							}
+							p.Log.Infoln("-----------", pod.name, "config finished -----------")
 						}
 					}
 
 					// host-side vpp config
+					p.Log.Infoln("-----------configuring host vpp -----------")
 					for _, link := range p.MocknetTopology.links {
 						if p.Is_Local(link.pod1) && p.Is_Local(link.pod2) {
 							// for both locals, xconnect them together
@@ -405,7 +386,8 @@ func (p *Plugin) watch_transport_done(ctx context.Context) error {
 							vxlan_instance += 1
 						}
 					}
-
+					p.Log.Infoln("----------- host vpp config finished -----------")
+					p.inform_finished("NetCreationFinished")
 					// readycount + 1
 					p.ReadyCount++
 				}
@@ -543,20 +525,6 @@ func (pod Pod) alloc_interface_id() error {
 	return nil
 }
 
-func (p *Plugin) Create_Podside_Interface(podname string, name string, id string) error {
-	key := "/vnf-agent/" + "mocknet-pod-" + podname + "/config/vpp/v2/interfaces/memif" + id
-	value := "{\"name\":\"" + name + "\",\"type\":\"MEMIF\",\"enabled\":true,\"memif\":{\"id\":" + id + ",\"socket_filename\":\"/run/vpp/memif.sock\"}}"
-	kv := clientv3.NewKV(p.MasterEtcdClient)
-
-	_, err := kv.Put(context.Background(), key, value)
-	if err != nil {
-		panic(err)
-	} else {
-		p.Log.Infoln("successfully commit pod-side config to etcd")
-	}
-	return nil
-}
-
 func (p *Plugin) clear_socket() error {
 	dir, err := ioutil.ReadDir(p.DirPrefix)
 	if err != nil {
@@ -569,21 +537,25 @@ func (p *Plugin) clear_socket() error {
 	return nil
 }
 
-func (p *Plugin) get_node_infos(local_hostname string) error {
-	p.Log.Infoln("waiting for node data from master")
-	kv := clientv3.NewKV(p.MasterEtcdClient)
-	var resp *clientv3.GetResponse
+func (p *Plugin) wait_for_response(event string) error {
+	p.Log.Infoln("waiting for event", event)
 	for {
-		temp, err := kv.Get(context.Background(), "/mocknet/nodeinfo/", clientv3.WithPrefix())
+		temp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/"+event, clientv3.WithPrefix())
 		if err != nil {
 			panic(err)
 		}
 		if len(temp.Kvs) != 0 {
-			resp = temp
 			break
 		}
 	}
+	return nil
+}
 
+func (p *Plugin) get_node_infos(local_hostname string) error {
+	p.Log.Infoln("waiting for node data from master")
+	p.wait_for_response("nodeinfo")
+	p.Log.Infoln("----------- pre-configure for nodes -----------")
+	resp, _ := p.MasterEtcdClient.Get(context.Background(), "/mocknet/nodeinfo", clientv3.WithPrefix())
 	// to find local host infos
 	for _, nodekv := range resp.Kvs {
 		split_value := strings.Split(string(nodekv.Value), ",")
@@ -598,45 +570,88 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 		if name == local_hostname {
 			p.Addresses.local_ip_address = nodeip
 			p.Addresses.local_vtep_address = vtepip
-		} else if name == "master" {
-			p.Addresses.master_ip_address = nodeip
-		}
-	}
+			p.Addresses.host_net_addr_24 = get_ip_net_24(nodeip)
 
-	// route from vpp namespace to local host linux namespace
-	p.Vpp.Add_Route(vpp.Route_Info{
-		Dst: vpp.IpNet{
-			Ip:   p.Addresses.local_ip_address,
-			Mask: 24,
-		},
-		Dev:   "tap0",
-		DevId: 1,
-	})
-
-	for _, nodekv := range resp.Kvs {
-		split_value := strings.Split(string(nodekv.Value), ",")
-		name := strings.Split(split_value[0], ":")[1]
-		nodeip := strings.Split(split_value[1], ":")[1]
-		vtepip := strings.Split(split_value[2], ":")[1]
-		if name == local_hostname {
 			p.Vpp.Create_Tap()
 			p.Vpp.Set_interface_state_up(1)
 			p.Vpp.Set_Interface_Ip(1, vpp.IpNet{
 				Ip:   vtepip,
 				Mask: 24,
 			})
-		} else if name != "master" {
+			p.Linux.Add_Route(linux.Route_Info{
+				Dst: linux.IpNet{
+					Ip:   vtepip,
+					Mask: 32,
+				},
+				Dev: "tap0",
+			})
+			p.Vpp.Add_Route(vpp.Route_Info{
+				Dst: vpp.IpNet{
+					Ip:   nodeip,
+					Mask: 32,
+				},
+				Dev:   "tap0",
+				DevId: 1,
+			})
+		} else if name == "master" {
+			p.Addresses.master_ip_address = nodeip
+		}
+	}
+
+	for _, nodekv := range resp.Kvs {
+		split_value := strings.Split(string(nodekv.Value), ",")
+		name := strings.Split(split_value[0], ":")[1]
+		nodeip := strings.Split(split_value[1], ":")[1]
+		vtepip := strings.Split(split_value[2], ":")[1]
+		if name != local_hostname && name != "master" {
+			// route to other worker vtep interface
+			p.Linux.Add_Route(linux.Route_Info{
+				Dst: linux.IpNet{
+					Ip:   vtepip,
+					Mask: 32,
+				},
+				Gw: linux.IpNet{
+					Ip: nodeip,
+				},
+				Dev: p.Linux.HostMainDevName,
+			})
+			p.Vpp.Add_Route(vpp.Route_Info{
+				Dst: vpp.IpNet{
+					Ip:   nodeip,
+					Mask: 32,
+				},
+				Gw: vpp.IpNet{
+					Ip:   p.Addresses.local_ip_address,
+					Mask: 32,
+				},
+				Dev:   "tap0",
+				DevId: 1,
+			})
 			p.Vpp.Add_Route(vpp.Route_Info{
 				Dst: vpp.IpNet{
 					Ip:   vtepip,
 					Mask: 32,
 				},
 				Gw: vpp.IpNet{
-					Ip: nodeip,
+					Ip:   p.Addresses.local_ip_address,
+					Mask: 32,
 				},
+				Dev:   "tap0",
+				DevId: 1,
 			})
 		}
 	}
+
+	// route from host-vpp to local host linux namespace
+	p.Vpp.Add_Route(vpp.Route_Info{
+		Dst: vpp.IpNet{
+			Ip:   p.Addresses.host_net_addr_24,
+			Mask: 24,
+		},
+		Dev:   "tap0",
+		DevId: 1,
+	})
+	p.Log.Infoln("----------- pre-configure for nodes finished -----------")
 
 	return nil
 }
@@ -759,22 +774,10 @@ unix {
 			p.Log.Infoln("created host vpp config file")
 		}
 	}
-
-	/*	cmd :=
-				`service vpp restart
-		while true
-		do
-			OUTPUT="$(service vpp status | grep active)"
-			if [ -z "$OUTPUT" ];then
-				echo "waiting for vpp service to restart"
-				sleep 1
-			else
-				break 1
-			fi
-		done
-		`
-
-			restart_cmd := exec.Command("bash", "-c", cmd)
-			restart_cmd.Run()*/
 	return nil
+}
+
+func get_ip_net_24(ip string) string {
+	split_ip := strings.Split(ip, ".")
+	return split_ip[0] + "." + split_ip[1] + "." + split_ip[2] + ".0"
 }
