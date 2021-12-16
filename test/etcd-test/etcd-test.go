@@ -48,7 +48,7 @@ func main() {
 	}
 	fmt.Println("clear all info finished")*/
 
-	/*getResp, err := kvs.Get(context.Background(), "", clientv3.WithPrefix())
+	getResp, err := kvs.Get(context.Background(), "", clientv3.WithPrefix())
 
 	if err != nil {
 		panic("error when clear all key-value")
@@ -56,11 +56,11 @@ func main() {
 	for _, kv := range getResp.Kvs {
 		fmt.Println("key:", string(kv.Key))
 		fmt.Println("value:", string(kv.Value))
-	}*/
-	_, err = kvs.Put(context.Background(), "/vnf-agent/mocknet-pod-h1/config/vpp/v2/interfaces/memif3", "{\"name\":\"memif3\",\"type\":\"MEMIF\",\"enabled\":true,\"memif\":{\"id\":1,\"socket_filename\":\"/run/vpp/memif.sock\"}}")
+	}
+	/*_, err = kvs.Put(context.Background(), "/vnf-agent/mocknet-pod-h1/config/vpp/v2/interfaces/memif3", "{\"name\":\"memif3\",\"type\":\"MEMIF\",\"enabled\":true,\"memif\":{\"id\":1,\"socket_filename\":\"/run/vpp/memif.sock\"}}")
 	if err != nil {
 		panic(err)
 	} else {
 		fmt.Println("successfully put a value to etcd")
-	}
+	}*/
 }

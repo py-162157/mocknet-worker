@@ -91,7 +91,7 @@ func (p *Plugin) Add_Route(route Route_Info) error {
 			panic(err)
 		}
 	} else {
-		p.Log.Infoln("successfully add a route to linux namespace!")
+		p.Log.Infoln("added a route to linux namespace!")
 	}
 
 	return nil

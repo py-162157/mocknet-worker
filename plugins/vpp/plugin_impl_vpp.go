@@ -37,7 +37,10 @@ import (
 	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
 )
 
-const SOCKET_NAME = "memif.sock"
+const (
+	SOCKET_NAME         = "memif.sock"
+	RETRY_TIME_INTERVAL = 5 * time.Second
+)
 
 var (
 	sockAddr = flag.String("sock", socketclient.DefaultSocketName, "Path to VPP binary API socket file")
@@ -131,8 +134,22 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) {
 		panic(err)
 	}
 
-	p.Log.Infoln("successfully created socket:", id, filename)
+	p.Log.Infoln("created socket:", id, filename)
+}
 
+func (p *Plugin) DeleteSocket(id uint32) {
+	req := &memif_2110.MemifSocketFilenameAddDel{
+		IsAdd:    false,
+		SocketID: id,
+	}
+	reply := &memif_2110.MemifSocketFilenameAddDelReply{}
+
+	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+		p.Log.Errorln("failed to delete memif socket, id =", id)
+		panic(err)
+	}
+
+	p.Log.Infoln("deleted socket:", id)
 }
 
 func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id uint32) uint32 {
@@ -155,8 +172,23 @@ func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id
 		panic(err)
 	}
 
-	p.Log.Infoln("successfully created interface id:", id, "socket-id:", socket_id, "role:", role_string)
+	p.Log.Infoln("created interface id:", id, "socket-id:", socket_id, "role:", role_string)
 	return uint32(reply.SwIfIndex)
+}
+
+func (p *Plugin) Delete_Memif_Interface(id uint32) error {
+	req := &memif_2110.MemifDelete{
+		SwIfIndex: interface_types_2110.InterfaceIndex(id),
+	}
+	reply := &memif_2110.MemifDeleteReply{}
+
+	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+		p.Log.Errorln("failed to delete memif interface, id =", id)
+		panic(err)
+	}
+
+	p.Log.Infoln("created interface id:", id)
+	return nil
 }
 
 func (p *Plugin) Pod_Create_Memif_Interface(pod_name string, role_string string, name string, id uint32) uint32 {
@@ -167,24 +199,8 @@ func (p *Plugin) Pod_Create_Memif_Interface(pod_name string, role_string string,
 		role = memif_2009.MEMIF_ROLE_API_SLAVE
 	}
 
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	req := &memif_2009.MemifCreate{
@@ -199,7 +215,7 @@ func (p *Plugin) Pod_Create_Memif_Interface(pod_name string, role_string string,
 		panic(err)
 	}
 
-	p.Log.Infoln("successfully created memif interface for pod", pod_name, ",id:", id, ",role:", role_string)
+	p.Log.Infoln("created memif interface for pod", pod_name, ",id:", id, ",role:", role_string)
 
 	return uint32(reply.SwIfIndex)
 }
@@ -214,28 +230,12 @@ func (p *Plugin) Set_interface_state_up(id uint32) {
 		p.Log.Errorln(err, "error setting interface state up")
 	}
 
-	//p.Log.Infoln("successfully set interface id", id, "state up")
+	p.Log.Infoln("set interface id", id, "state up")
 }
 
 func (p *Plugin) Pod_Set_interface_state_up(pod_name string, id uint32) {
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	req := &interfaces_2009.SwInterfaceSetFlags{
@@ -247,10 +247,11 @@ func (p *Plugin) Pod_Set_interface_state_up(pod_name string, id uint32) {
 		p.Log.Errorln(err, "error setting interface state up")
 	}
 
-	p.Log.Infoln("successfully set interface id", id, "state up")
+	p.Log.Infoln("set interface id", id, "state up for pod", pod_name)
 }
 
 func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instance uint32) uint32 {
+	p.Log.Infoln("src =", src, "dst =", dst, "vni =", vni, "instance =", instance)
 	src_addr := strings.Split(src, ".")
 	src_addr_slice := make([]uint8, 4)
 	for i := 0; i < 4; i++ {
@@ -266,7 +267,8 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 	for i := 0; i < 4; i++ {
 		conv, err := strconv.Atoi(dst_addr[i])
 		if err != nil {
-			panic("error parsing dst ip address string to int")
+			p.Log.Error("error parsing dst ip address string to int, error is", err)
+			panic(err)
 		}
 		dst_addr_slice[i] = uint8(conv)
 	}
@@ -303,11 +305,30 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 			time.Sleep(500000000)
 			p.Log.Errorln(err)
 		} else {
-			p.Log.Infoln("successfully created vxlan tunnel:", "src:", src, "dst:", dst, "vni:", vni)
+			p.Log.Infoln("created vxlan tunnel:", "src:", src, "dst:", dst, "vni:", vni)
 			break
 		}
 	}
 	return uint32(reply.SwIfIndex)
+}
+
+func (p *Plugin) Delete_Vxlan_Tunnel(id uint32) error {
+	req := &vxlan_2110.VxlanAddDelTunnel{
+		IsAdd:          false,
+		McastSwIfIndex: interface_types_2110.InterfaceIndex(id),
+	}
+	reply := &vxlan_2110.VxlanAddDelTunnelReply{}
+	for {
+		if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+			p.Log.Warningln("failed to delete vxlan tunnel, retry")
+			time.Sleep(500000000)
+			p.Log.Errorln(err)
+		} else {
+			p.Log.Infoln("deleted vxlan tunnel:", "id:", id)
+			break
+		}
+	}
+	return nil
 }
 
 func (p *Plugin) XConnect(tx_id uint32, rx_id uint32) error {
@@ -318,34 +339,21 @@ func (p *Plugin) XConnect(tx_id uint32, rx_id uint32) error {
 	}
 	reply := &l2_2110.SwInterfaceSetL2XconnectReply{}
 
-	if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
-		p.Log.Errorln("failed to xconnect interfaces")
-		panic(err)
+	for {
+		if err := p.Channel.SendRequest(req).ReceiveReply(reply); err != nil {
+			p.Log.Errorln("failed to xconnect interfaces, retrying, error is:", err)
+		} else {
+			break
+		}
+		time.Sleep(RETRY_TIME_INTERVAL)
 	}
-
-	p.Log.Infoln("successfully xconnect:", "tx_id:", tx_id, "rx_id:", rx_id)
+	p.Log.Infoln("xconnect:", "tx_id:", tx_id, "rx_id:", rx_id)
 	return nil
 }
 
 func (p *Plugin) Pod_Xconnect(pod_name string, tx_id uint32, rx_id uint32) error {
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	count := 0
@@ -370,30 +378,14 @@ func (p *Plugin) Pod_Xconnect(pod_name string, tx_id uint32, rx_id uint32) error
 		}
 	}
 
-	p.Log.Infoln("successfully xconnect for", pod_name, ": tx_id:", tx_id, "rx_id:", rx_id)
+	p.Log.Infoln("xconnected for", pod_name, ": tx_id:", tx_id, "rx_id:", rx_id)
 
 	return nil
 }
 
 func (p *Plugin) Pod_Bridge(pod_name string, ints_id []uint32, bridge_id uint32) error {
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	req := &l2_2009.BridgeDomainAddDel{
@@ -411,7 +403,7 @@ func (p *Plugin) Pod_Bridge(pod_name string, ints_id []uint32, bridge_id uint32)
 		panic(err)
 	}
 
-	p.Log.Infoln("successfully create bridge domain id:", bridge_id, "in pod:", pod_name)
+	p.Log.Infoln("created bridge domain id:", bridge_id, "in pod:", pod_name)
 
 	for _, id := range ints_id {
 		req := &l2_2009.SwInterfaceSetL2Bridge{
@@ -426,7 +418,7 @@ func (p *Plugin) Pod_Bridge(pod_name string, ints_id []uint32, bridge_id uint32)
 			panic(err)
 		}
 
-		p.Log.Infoln("successfully bridge interface ", id, "to domain", bridge_id, "in pod:", pod_name)
+		p.Log.Infoln("bridged interface ", id, "to domain", bridge_id, "in pod:", pod_name)
 	}
 
 	return nil
@@ -452,7 +444,7 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) error {
 		p.Log.Errorln("failed to set interface address")
 	}
 
-	p.Log.Infoln("successfully set interface address")
+	p.Log.Infoln("set interface address")
 
 	return nil
 }
@@ -467,30 +459,14 @@ func (p *Plugin) Create_Tap() error {
 		p.Log.Errorln("failed to create host tap interface")
 	}
 
-	p.Log.Infoln("successfully created host tap interface")
+	p.Log.Infoln("created host tap interface")
 
 	return nil
 }
 
 func (p *Plugin) Pod_Create_Tap(pod_name string) (bool, int32) {
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	req := &tap_2009.TapCreateV2{
@@ -580,29 +556,13 @@ func (p *Plugin) Add_Route(route Route_Info) error {
 		p.Log.Errorln("failed to add vpp route, dst:", route.Dst, ", via:", route.Gw, ", dev:", route.Dev)
 		panic(err)
 	}
-	p.Log.Infoln("successfully added vpp route, dst:", route.Dst, ", via:", route.Gw, ", dev:", route.Dev)
+	p.Log.Infoln("added vpp route, dst:", route.Dst, ", via:", route.Gw, ", dev:", route.Dev)
 	return nil
 }
 
 func (p *Plugin) Pod_Add_Route(pod_name string, route Route_Info) error {
-	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
-	if err != nil {
-		p.Log.Errorln("ERROR:", err)
-	}
-
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
-		}
-	}
+	conn, ch := p.connect_to_pod_vpp(pod_name)
 	defer conn.Disconnect()
-
-	ch, err := conn.NewAPIChannel()
-	if err != nil {
-		p.Log.Errorln("error when connect to pod-side vpp")
-		panic(err)
-	}
 	defer ch.Close()
 
 	req := &ip_2009.IPRouteAddDel{
@@ -645,7 +605,28 @@ func (p *Plugin) Pod_Add_Route(pod_name string, route Route_Info) error {
 		p.Log.Errorln("failed to add ip route for pod", pod_name)
 	}
 
-	p.Log.Infoln("successfully added ip route for pod", pod_name)
+	p.Log.Infoln("added ip route for pod", pod_name)
 
 	return nil
+}
+
+func (p *Plugin) connect_to_pod_vpp(pod_name string) (*core.Connection, api.Channel) {
+	conn, conev, err := govpp.AsyncConnect(pod_sock+pod_name+"/api.sock", 10*core.DefaultMaxReconnectAttempts, 10*core.DefaultReconnectInterval)
+	if err != nil {
+		p.Log.Errorln("ERROR:", err)
+	}
+
+	select {
+	case e := <-conev:
+		if e.State != core.Connected {
+			p.Log.Errorln("ERROR: connecting to pod-side VPP failed or interrupted:", e.Error)
+		}
+	}
+
+	ch, err := conn.NewAPIChannel()
+	if err != nil {
+		p.Log.Errorln("error when connect to pod-side vpp")
+		panic(err)
+	}
+	return conn, ch
 }

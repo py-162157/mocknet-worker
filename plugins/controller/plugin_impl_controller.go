@@ -8,6 +8,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mocknet/plugins/linux"
@@ -20,7 +21,6 @@ import (
 var (
 	TIMEOUT              = time.Duration(3) * time.Second // 超时
 	ETCD_ADDRESS         = "0.0.0.0:32379"
-	vxlan_instance       = 0
 	POD_VPP_CONFIG_FILE  = "/etc/vpp/vpp.conf"
 	HOST_VPP_CONFIG_FILE = "/etc/vpp/startup.conf"
 )
@@ -37,8 +37,8 @@ type Deps struct {
 	Vpp             *vpp.Plugin
 	Linux           *linux.Plugin
 	MocknetTopology NetTopo
-	PodInfos        map[string]podinfo
-	Nodeinfos       map[string]Nodeinfo
+	PodInfos        PodInfosSync
+	NodeInfos       NodeInfosSync
 	PodSet          map[string]map[string]string
 	DirAssign       []string // really needed?
 	DirPrefix       string
@@ -52,10 +52,28 @@ type Deps struct {
 	Addresses       DepAdress
 	// key: interface name (podname-interfaceid)
 	// value: interface id in host-side vpp
-	IntToVppId    map[string]uint32
+	IntToVppId    IntToVppIdSync
 	LocalHostName string
+	VxlanInstance uint32
+	// only the routine that got the pod's lock can config it
+	PodConfig map[string]*sync.RWMutex
 
 	Log logging.PluginLogger
+}
+
+type IntToVppIdSync struct {
+	Lock *sync.Mutex
+	List map[string]uint32
+}
+
+type PodInfosSync struct {
+	Lock *sync.Mutex
+	List map[string]podinfo
+}
+
+type NodeInfosSync struct {
+	Lock *sync.Mutex
+	List map[string]Nodeinfo
 }
 
 type DepAdress struct {
@@ -72,15 +90,16 @@ type Nodeinfo struct {
 }
 
 type podinfo struct {
-	name      string
-	namespace string
-	podip     string
-	hostip    string
-	hostname  string
+	name         string
+	namespace    string
+	podip        string
+	hostip       string
+	hostname     string
+	restartcount int
 }
 
 type NetTopo struct {
-	pods  map[string]Pod
+	pods  map[string]*Pod
 	links []Link
 }
 
@@ -88,7 +107,8 @@ type Pod struct {
 	name string
 	// key: interface name in mininet,
 	// value: interface id in vpp
-	infs map[string]int
+	infs  map[string]int
+	links []Link
 }
 
 type Link struct {
@@ -112,17 +132,28 @@ func (p *Plugin) Init() error {
 	p.create_work_directory(p.DirPrefix)
 
 	p.MocknetTopology = NetTopo{
-		pods:  make(map[string]Pod),
+		pods:  make(map[string]*Pod),
 		links: make([]Link, 0),
 	}
 	p.PodSet = make(map[string]map[string]string)
-	p.PodInfos = make(map[string]podinfo)
-	p.Nodeinfos = make(map[string]Nodeinfo)
+	p.PodInfos = PodInfosSync{
+		Lock: &sync.Mutex{},
+		List: make(map[string]podinfo),
+	}
+	p.NodeInfos = NodeInfosSync{
+		Lock: &sync.Mutex{},
+		List: make(map[string]Nodeinfo),
+	}
 	p.DirAssign = make([]string, 0)
 	p.ReadyCount = 0
 	p.InterfaceIDName = make(map[uint32]string)
 	p.InterfaceNameID = make(map[string]uint32)
-	p.IntToVppId = make(map[string]uint32)
+	p.IntToVppId = IntToVppIdSync{
+		Lock: &sync.Mutex{},
+		List: make(map[string]uint32),
+	}
+	p.VxlanInstance = 0
+	p.PodConfig = make(map[string]*sync.RWMutex)
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -136,7 +167,7 @@ func (p *Plugin) Init() error {
 		panic(err)
 	} else {
 		p.MasterEtcdClient = client
-		p.Log.Infoln("successfully connected to master etcd")
+		p.Log.Infoln("connected to master etcd")
 	}
 
 	if local_hostname, err := os.Hostname(); err != nil {
@@ -149,8 +180,7 @@ func (p *Plugin) Init() error {
 	p.generate_etcd_config()
 
 	go p.watch_topology(context.Background())
-	go p.watch_pods_info(context.Background())
-	go p.watch_transport_done(context.Background())
+	go p.watch_pods_creation(context.Background())
 
 	return nil
 }
@@ -193,7 +223,7 @@ func (p Plugin) generate_etcd_config() error {
 	cmd := exec.Command("bash", "-c", ip_cmd)
 	cmd.Run()
 
-	p.Log.Infoln("successfully set etcd.conf!")
+	p.Log.Infoln("set etcd.conf!")
 
 	return nil
 }
@@ -212,25 +242,31 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/link/", clientv3.WithPrefix(), clientv3.WithRev(getResp.Header.Revision+1))
 
 	for {
+		receive_count := 0
 		select {
 		case <-time.After(3 * time.Second):
-			p.inform_finished("ParseTopologyInfo")
+			if receive_count > 0 {
+				//p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
+				//p.Log.Infoln("p.MocknetTopology.links =", p.MocknetTopology.links)
+				p.inform_finished("ParseTopologyInfo")
+			}
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
+			receive_count += 1
 			err := resp.Err()
 			if err != nil {
 				return err
 			}
 			for _, ev := range resp.Events {
 				if ev.IsCreate() {
+					//p.Log.Infoln("receive a link infomation, key =", string(ev.Kv.Key), ", value =", string(ev.Kv.Value))
 					p.translate(*ev)
 					p.topology_make()
 				} else if ev.IsModify() {
 
 				} else if ev.Type == 1 { // 1 present DELETE
 
-				} else {
 				}
 			}
 		}
@@ -244,199 +280,8 @@ func (p *Plugin) inform_finished(event string) error {
 	}
 	kv := clientv3.NewKV(p.MasterEtcdClient)
 	kv.Put(context.Background(), "/mocknet/"+event+"/"+hostname, "done")
+	p.Log.Infoln("informed the master that finished event", event)
 	return nil
-}
-
-func (p *Plugin) topology_make() error {
-	for podname, infset := range p.PodSet {
-		infs := make(map[string]int)
-		for inf := range infset {
-			// -1 represent unalloc
-			infs[inf] = -1
-		}
-		pod := Pod{
-			name: podname,
-			infs: infs,
-		}
-
-		p.MocknetTopology.pods[podname] = pod
-	}
-
-	return nil
-}
-
-func (p *Plugin) watch_transport_done(ctx context.Context) error {
-	ctx1 := context.Background()
-	var getResp *clientv3.GetResponse
-	var err error
-	getResp, err = p.MasterEtcdClient.Get(ctx1, "/mocknet/topo/ready")
-
-	if err != nil {
-		return err
-	}
-
-	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/topo/ready", clientv3.WithRev(getResp.Header.Revision+1))
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case resp := <-watchChan:
-			err := resp.Err()
-			if err != nil {
-				return err
-			}
-			for _, ev := range resp.Events {
-				creation_count, err := strconv.Atoi(string(ev.Kv.Value))
-				if err != nil {
-					panic(err)
-				}
-				if p.ReadyCount < creation_count {
-					for _, pod := range p.MocknetTopology.pods {
-						if p.Is_Local(pod.name) {
-							p.Log.Infoln("pod", pod.name, "is local, so start to config it")
-							p.Log.Infoln("----------- configuring", pod.name, "-----------")
-							// create memif socket
-							p.assign_dir_to_pod(pod.name)
-							id := p.get_socket_id(pod.name) + 1
-							p.Log.Infoln("pod name:", pod.name)
-							filedir := p.DirPrefix + pod.name
-							p.Vpp.CreateSocket(uint32(id), filedir)
-
-							// create memif interface
-							pod.alloc_interface_id()
-
-							for _, vpp_id := range pod.infs {
-								// host-side
-								global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id))
-								p.Vpp.Set_interface_state_up(global_id)
-								p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
-								p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
-								p.IntToVppId[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
-
-								// pod-side
-								inf_name := "memif" + strconv.Itoa(vpp_id)
-								// int_id is the id in a socket used to identify peer(slave or master)
-								//inf_id := strconv.Itoa(vpp_id)
-								//p.Create_Podside_Interface(pod.name, inf_name, inf_id)
-								pod_int_id := p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
-								p.Vpp.Pod_Set_interface_state_up(pod.name, pod_int_id)
-							}
-
-							// write pod-vpp-tap to pod-vpp-memif route
-							if string([]byte(pod.name)[:1]) == "h" {
-								// probe weather tap0 interface exist
-								result, tap_id := p.Vpp.Pod_Create_Tap(pod.name)
-								if result {
-									p.Vpp.Pod_Set_interface_state_up(pod.name, uint32(tap_id))
-									// recreate tap interface successfully, need to config it
-									p.MasterEtcdClient.Put(context.Background(), "/mocknet/PodTapReCofiguration-"+pod.name, pod.name)
-									p.wait_for_response("PodTapConfigFinished-" + pod.name)
-								} else {
-									tap_id = 1
-									p.Vpp.Pod_Set_interface_state_up(pod.name, 1)
-								}
-
-								// write pod-vpp to pod pod-linux route
-								p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
-									Dst: vpp.IpNet{
-										Ip:   p.PodInfos[pod.name].podip,
-										Mask: 32,
-									},
-									Dev:   "tap0",
-									DevId: uint32(tap_id),
-								})
-								p.Vpp.Pod_Xconnect(pod.name, 1, 2)
-								p.Vpp.Pod_Xconnect(pod.name, 2, 1)
-
-							} else if string([]byte(pod.name)[:1]) == "s" {
-								// bridge interfaces in switch pod together
-								// manually
-								ints_id := make([]uint32, 0)
-								for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
-									ints_id = append(ints_id, uint32(i+1))
-								}
-								p.Vpp.Pod_Bridge(pod.name, ints_id, 1)
-
-							} else {
-								p.Log.Errorln("the judgement character is ", string([]byte(pod.name)[:1]))
-								panic("pod type judgement error!")
-							}
-							p.Log.Infoln("-----------", pod.name, "config finished -----------")
-						}
-					}
-
-					// host-side vpp config
-					p.Log.Infoln("-----------configuring host vpp -----------")
-					for _, link := range p.MocknetTopology.links {
-						if p.Is_Local(link.pod1) && p.Is_Local(link.pod2) {
-							// for both locals, xconnect them together
-							p.Vpp.XConnect(p.IntToVppId[link.pod1+"-"+link.pod1inf], p.IntToVppId[link.pod2+"-"+link.pod2inf])
-
-						} else if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
-							// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
-							src_address := p.Addresses.local_vtep_address
-							dst_address := p.Nodeinfos[p.PodInfos[link.pod2].hostname].vtepip
-							vni := uint32(link.vni)
-							instance := vxlan_instance
-							vxlan_id := p.Vpp.Create_Vxlan_Tunnel(src_address, dst_address, vni, uint32(instance))
-
-							p.Vpp.XConnect(p.IntToVppId[link.pod1+"-"+link.pod1inf], vxlan_id)
-							p.Vpp.XConnect(vxlan_id, p.IntToVppId[link.pod1+"-"+link.pod1inf])
-							vxlan_instance += 1
-						}
-					}
-					p.Log.Infoln("----------- host vpp config finished -----------")
-					p.inform_finished("NetCreationFinished")
-					// readycount + 1
-					p.ReadyCount++
-				}
-			}
-		}
-	}
-}
-
-func (p *Plugin) watch_pods_info(ctx context.Context) error {
-	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/pods", clientv3.WithPrefix())
-
-	for {
-		select {
-		case <-time.After(3 * time.Second):
-			p.inform_finished("ParsePodsInfo")
-		case <-ctx.Done():
-			return nil
-		case resp := <-watchChan:
-			err := resp.Err()
-			if err != nil {
-				return err
-			}
-			for _, ev := range resp.Events {
-				if ev.IsCreate() {
-					parse_result := parse_pod_info(*ev)
-					p.PodInfos[parse_result.name] = parse_result
-				} else if ev.IsModify() {
-					parse_result := parse_pod_info(*ev)
-					p.PodInfos[parse_result.name] = parse_result
-				} else if ev.Type == 1 { // 1 present DELETE
-					pod_name := strings.Split(string(ev.Kv.Key), "/")[2]
-					delete(p.PodInfos, pod_name)
-				} else {
-				}
-			}
-		}
-	}
-}
-
-func parse_pod_info(event clientv3.Event) podinfo {
-	v := string(event.Kv.Value)
-	split_info := strings.Split(v, ",")
-	return podinfo{
-		name:      strings.Split(split_info[0], ":")[1],
-		namespace: strings.Split(split_info[1], ":")[1],
-		podip:     strings.Split(split_info[2], ":")[1],
-		hostip:    strings.Split(split_info[3], ":")[1],
-		hostname:  strings.Split(split_info[4], ":")[1],
-	}
 }
 
 func (p *Plugin) translate(event clientv3.Event) error {
@@ -489,8 +334,282 @@ func (p *Plugin) translate(event clientv3.Event) error {
 	return nil
 }
 
+func (p *Plugin) topology_make() error {
+	for podname, infset := range p.PodSet {
+		infs := make(map[string]int)
+		for inf := range infset {
+			// -1 represent unalloc
+			infs[inf] = -1
+		}
+		pod := Pod{
+			name: podname,
+			infs: infs,
+		}
+
+		p.MocknetTopology.pods[podname] = &pod
+	}
+
+	for _, link := range p.MocknetTopology.links {
+		if pod, ok := p.MocknetTopology.pods[link.pod1]; ok {
+			pod.links = append(pod.links, link)
+		} else {
+			panic("pod not exist in '.MocknetTopology.Pods'")
+		}
+	}
+
+	return nil
+}
+
+func (p *Plugin) watch_pods_creation(ctx context.Context) error {
+	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/pods", clientv3.WithPrefix())
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case resp := <-watchChan:
+			err := resp.Err()
+			if err != nil {
+				return err
+			}
+			for _, ev := range resp.Events {
+				if err != nil {
+					panic(err)
+				}
+				if ev.IsCreate() {
+					parse_result := parse_pod_info(*ev)
+					p.PodConfig[parse_result.name] = &sync.RWMutex{}
+					//p.Log.Infoln("receive pod message for", parse_result.name)
+					p.PodInfos.Lock.Lock()
+					//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
+					p.PodInfos.List[parse_result.name] = parse_result
+					p.PodInfos.Lock.Unlock()
+					//p.Log.Infoln(parse_result.name, "has released the lock of PodInfos")
+					p.Set_Create_Pod(parse_result)
+				} else if ev.IsModify() {
+					parse_result := parse_pod_info(*ev)
+					p.PodInfos.Lock.Lock()
+					//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
+					p.PodInfos.List[parse_result.name] = parse_result
+					p.PodInfos.Lock.Unlock()
+					//p.Log.Infoln(parse_result.name, "has released the lock of PodInfos")
+					split_info := strings.Split(string(ev.Kv.Value), ",")
+					old_restart_count, err := strconv.Atoi(strings.Split(split_info[5], ":")[1])
+					if err != nil {
+						panic("restart count is invalid")
+					}
+					if parse_result.restartcount > old_restart_count {
+						p.Set_Recreate_Pod(parse_result)
+					}
+				}
+			}
+		}
+	}
+}
+
+func (p *Plugin) Set_Create_Pod(parse_result podinfo) error {
+	pod := p.MocknetTopology.pods[parse_result.name]
+	if p.Is_Local(pod.name) {
+		p.Log.Infoln(pod.name, "has got the lock of PodConfig")
+		p.PodConfig[pod.name].Lock()
+		p.Log.Infoln("pod", pod.name, "is local, so start to config it")
+		p.Completed_Config(*pod)
+		p.Set_Connection(*pod)
+	}
+
+	return nil
+}
+
+func (p *Plugin) Set_Recreate_Pod(parse_result podinfo) error {
+	pod := p.MocknetTopology.pods[parse_result.name]
+	if p.Is_Local(pod.name) {
+		p.Log.Infoln("receive a restart signal for local pod", parse_result.name, ", start to reconfig it")
+		p.Clear_Completed_Config(*pod)
+		p.Completed_Config(*pod)
+		p.Set_Connection(*pod)
+	}
+
+	return nil
+}
+
+func (p *Plugin) Completed_Config(pod Pod) error {
+	// create memif socket
+	p.assign_dir_to_pod(pod.name)
+	id := p.get_socket_id(pod.name) + 1
+	p.Log.Infoln("pod name:", pod.name)
+	filedir := p.DirPrefix + pod.name
+	p.Vpp.CreateSocket(uint32(id), filedir)
+
+	// create memif interface
+	pod.alloc_interface_id()
+
+	for _, vpp_id := range pod.infs {
+		// host-side
+		global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id))
+		p.Vpp.Set_interface_state_up(global_id)
+		p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
+		p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
+		p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
+
+		// pod-side
+		inf_name := "memif" + strconv.Itoa(vpp_id)
+		// int_id is the id in a socket used to identify peer(slave or master)
+		pod_int_id := p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
+		p.Vpp.Pod_Set_interface_state_up(pod.name, pod_int_id)
+	}
+
+	// write pod-vpp-tap to pod-vpp-memif route
+	if string([]byte(pod.name)[:1]) == "h" {
+		// probe weather tap0 interface exist
+		result, tap_id := p.Vpp.Pod_Create_Tap(pod.name)
+		if result {
+			p.Vpp.Pod_Set_interface_state_up(pod.name, uint32(tap_id))
+			// recreate tap interface successfully, need to config it
+			p.MasterEtcdClient.Put(context.Background(), "/mocknet/PodTapReCofiguration-"+pod.name, pod.name)
+			p.wait_for_response("PodTapConfigFinished-" + pod.name)
+		} else {
+			tap_id = 1
+			p.Vpp.Pod_Set_interface_state_up(pod.name, 1)
+		}
+
+		// write pod-vpp to pod pod-linux route
+		p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
+			Dst: vpp.IpNet{
+				Ip:   p.PodInfos.List[pod.name].podip,
+				Mask: 32,
+			},
+			Dev:   "tap0",
+			DevId: uint32(tap_id),
+		})
+		p.Vpp.Pod_Xconnect(pod.name, 1, 2)
+		p.Vpp.Pod_Xconnect(pod.name, 2, 1)
+
+	} else if string([]byte(pod.name)[:1]) == "s" {
+		// bridge interfaces in switch pod together
+		ints_id := make([]uint32, 0)
+		for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
+			ints_id = append(ints_id, uint32(i+1))
+		}
+		p.Vpp.Pod_Bridge(pod.name, ints_id, 1)
+
+	} else {
+		p.Log.Errorln("the judgement character is ", string([]byte(pod.name)[:1]))
+		panic("pod type judgement error!")
+	}
+	return nil
+}
+
+func (p *Plugin) Clear_Completed_Config(pod Pod) error {
+	id := p.get_socket_id(pod.name) + 1
+	p.Vpp.DeleteSocket(uint32(id))
+
+	for _, vpp_id := range pod.infs {
+		memif_int_id := p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)]
+		p.Vpp.Delete_Memif_Interface(memif_int_id)
+	}
+
+	p.VxlanInstance = 0
+	for int_name, vpp_id := range p.IntToVppId.List {
+		if strings.Split(int_name, "-")[1] == pod.name {
+			p.Vpp.Delete_Vxlan_Tunnel(vpp_id)
+		}
+	}
+
+	return nil
+}
+
+func (p *Plugin) Set_Connection(pod Pod) error {
+	vxlan_total := 0
+	for _, link := range pod.links {
+		if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
+			vxlan_total += 1
+		}
+	}
+
+	vxlan_count := 0
+	// host-side vpp config
+	for _, link := range pod.links {
+		p.Log.Infoln("the link =", link)
+		if p.Is_Local(link.pod1) && p.Is_Local(link.pod2) {
+			// for both locals, xconnect them together
+			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1], p.IntToVppId.List[link.pod2+"-"+link.pod2inf])
+		} else if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
+			// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
+			src_address := p.Addresses.local_vtep_address
+			vni := uint32(link.vni)
+			p.Log.Infoln("origin vni =", link.vni)
+			go p.Create_Vxlan_And_Connect(link, src_address, link.pod2, vni, p.VxlanInstance, &vxlan_count, vxlan_total)
+			p.VxlanInstance += 1
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) Create_Vxlan_And_Connect(link Link, src string, peer_name string, vni uint32, instance uint32, vxlan_count *int, vxlan_total int) error {
+	var dst_address string
+	try_count := 0
+	for {
+		// it means that dst pod's info hasn't been received, wait until it does
+		p.PodInfos.Lock.Lock()
+		p.NodeInfos.Lock.Lock()
+		//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+		//p.Log.Infoln(link.pod1, "has got the lock of NodeInfos")
+		dst_temp := p.NodeInfos.List[p.PodInfos.List[link.pod2].hostname].vtepip
+		p.PodInfos.Lock.Unlock()
+		p.NodeInfos.Lock.Unlock()
+		//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
+		//p.Log.Infoln(link.pod1, "has released the lock of NodeInfos")
+		if dst_temp != "" {
+			dst_address = dst_temp
+			if try_count >= 1 {
+				p.Log.Infoln(link.pod1+"'s", "information request of pod", link.pod1, "has been met")
+			}
+			break
+		}
+		// only print once
+		if try_count == 0 {
+			p.Log.Infoln("pod", link.pod1, "is waitting for info of pod", peer_name)
+		}
+		time.Sleep(3 * time.Second)
+		try_count += 1
+	}
+	vxlan_id := p.Vpp.Create_Vxlan_Tunnel(src, dst_address, vni, instance)
+	p.IntToVppId.Lock.Lock()
+	//p.Log.Infoln(link.pod1, "has got the lock of IntToVppId")
+	p.IntToVppId.List["vxlan"+strconv.Itoa(int(instance))+"-"+link.pod1] = vxlan_id
+	p.IntToVppId.Lock.Unlock()
+	//p.Log.Infoln(link.pod1, "has released the lock of IntToVppId")
+	p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], vxlan_id)
+	p.Vpp.XConnect(vxlan_id, p.IntToVppId.List[link.pod1+"-"+link.pod1inf])
+	*vxlan_count += 1
+	if *vxlan_count == vxlan_total {
+		p.PodConfig[link.pod1].Unlock()
+		//p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
+		p.Log.Infoln("-----------", link.pod1, "config finished -----------")
+	}
+
+	return nil
+}
+
+func parse_pod_info(event clientv3.Event) podinfo {
+	v := string(event.Kv.Value)
+	split_info := strings.Split(v, ",")
+	restart_count, err := strconv.Atoi(strings.Split(split_info[5], ":")[1])
+	if err != nil {
+		panic("restart count is invalid")
+	}
+	return podinfo{
+		name:         strings.Split(split_info[0], ":")[1],
+		namespace:    strings.Split(split_info[1], ":")[1],
+		podip:        strings.Split(split_info[2], ":")[1],
+		hostip:       strings.Split(split_info[3], ":")[1],
+		hostname:     strings.Split(split_info[4], ":")[1],
+		restartcount: restart_count,
+	}
+}
+
 func (p *Plugin) Is_Local(name string) bool {
-	if p.PodInfos[name].hostip == p.Addresses.local_ip_address {
+	if p.PodInfos.List[name].hostip == p.Addresses.local_ip_address {
 		return true
 	} else {
 		return false
@@ -554,7 +673,7 @@ func (p *Plugin) wait_for_response(event string) error {
 func (p *Plugin) get_node_infos(local_hostname string) error {
 	p.Log.Infoln("waiting for node data from master")
 	p.wait_for_response("nodeinfo")
-	p.Log.Infoln("----------- pre-configure for nodes -----------")
+	p.Log.Infoln("----------- configure for nodes -----------")
 	resp, _ := p.MasterEtcdClient.Get(context.Background(), "/mocknet/nodeinfo", clientv3.WithPrefix())
 	// to find local host infos
 	for _, nodekv := range resp.Kvs {
@@ -562,7 +681,7 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 		name := strings.Split(split_value[0], ":")[1]
 		nodeip := strings.Split(split_value[1], ":")[1]
 		vtepip := strings.Split(split_value[2], ":")[1]
-		p.Nodeinfos[name] = Nodeinfo{
+		p.NodeInfos.List[name] = Nodeinfo{
 			name:   name,
 			nodeip: nodeip,
 			vtepip: vtepip,
@@ -651,22 +770,7 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 		Dev:   "tap0",
 		DevId: 1,
 	})
-	p.Log.Infoln("----------- pre-configure for nodes finished -----------")
-
-	return nil
-}
-
-// inform other node of vxlan information.
-func (p *Plugin) vxlan_info_operation(link Link) error {
-	local_kv := clientv3.NewKV(p.MasterEtcdClient)
-	resp, err := local_kv.Get(context.Background(), "/mocknet/vxlan/"+link.pod1)
-	if err != nil {
-		panic(err)
-	}
-
-	if len(resp.Kvs) == 0 {
-
-	}
+	p.Log.Infoln("----------- configure for nodes finished -----------")
 
 	return nil
 }
