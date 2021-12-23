@@ -20,7 +20,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
 	//"os"
@@ -54,8 +53,6 @@ var (
 
 func main() {
 	flag.Parse()
-
-	fmt.Println("Starting simple client example")
 
 	// connect to VPP asynchronously
 	conn, conev, err := govpp.AsyncConnect(*sockAddr, core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
@@ -106,12 +103,14 @@ func main() {
 	//Set_Interface_Ip(ch)
 	//Add_Route(ch)
 	//Create_Tap(ch)
+	//Delete_Vxlan_Tunnel(ch)
+	Delete_Memif_Interface(ch)
 
-	if err := ch.CheckCompatiblity(memif_2110.AllMessages()...); err != nil {
+	/*if err := ch.CheckCompatiblity(memif_2110.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
 	} else {
 		fmt.Println("interfaces compatiblity check passed")
-	}
+	}*/
 
 	/*if err := ch.CheckCompatiblity(memif.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
@@ -119,12 +118,12 @@ func main() {
 		fmt.Println("memif compatiblity check passed")
 	}*/
 
-	if len(Errors) > 0 {
+	/*if len(Errors) > 0 {
 		fmt.Printf("finished with %d errors\n", len(Errors))
 		os.Exit(1)
 	} else {
 		fmt.Println("finished successfully")
-	}
+	}*/
 }
 
 var Errors []error
@@ -370,5 +369,47 @@ func Create_Tap(ch api.Channel) error {
 
 	fmt.Println("successfully created host tap interface")
 
+	return nil
+}
+
+func Delete_Vxlan_Tunnel(ch api.Channel) error {
+	req := &vxlan_2110.VxlanAddDelTunnel{
+		IsAdd:          false,
+		McastSwIfIndex: interface_types_2110.InterfaceIndex(14),
+		SrcAddress: ip_types_2110.Address{
+			Af: 0,
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
+				10, 1, 1, 1,
+			}),
+		},
+		DstAddress: ip_types_2110.Address{
+			Af: 0,
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
+				10, 1, 1, 2,
+			}),
+		},
+	}
+	reply := &vxlan_2110.VxlanAddDelTunnelReply{}
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to delete vxlan tunnel, retry")
+		fmt.Println(err)
+	} else {
+		fmt.Println("deleted vxlan tunnel:", "id:", 14)
+	}
+	return nil
+}
+
+func Delete_Memif_Interface(ch api.Channel) error {
+	req := &memif_2110.MemifDelete{
+		SwIfIndex: interface_types_2110.InterfaceIndex(100),
+	}
+	reply := &memif_2110.MemifDeleteReply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to delete memif interface, id =", 100)
+		panic(err)
+	}
+
+	fmt.Println("deleted interface id:", 100)
 	return nil
 }

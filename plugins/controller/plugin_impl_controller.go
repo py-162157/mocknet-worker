@@ -18,11 +18,12 @@ import (
 	"go.ligato.io/cn-infra/v2/logging"
 )
 
-var (
+const (
 	TIMEOUT              = time.Duration(3) * time.Second // 超时
 	ETCD_ADDRESS         = "0.0.0.0:32379"
 	POD_VPP_CONFIG_FILE  = "/etc/vpp/vpp.conf"
 	HOST_VPP_CONFIG_FILE = "/etc/vpp/startup.conf"
+	RETRY_TIMES          = 3
 )
 
 type Plugin struct {
@@ -54,9 +55,9 @@ type Deps struct {
 	// value: interface id in host-side vpp
 	IntToVppId    IntToVppIdSync
 	LocalHostName string
-	VxlanInstance uint32
 	// only the routine that got the pod's lock can config it
 	PodConfig map[string]*sync.RWMutex
+	LocalPods []string
 
 	Log logging.PluginLogger
 }
@@ -96,6 +97,7 @@ type podinfo struct {
 	hostip       string
 	hostname     string
 	restartcount int
+	containerid  string
 }
 
 type NetTopo struct {
@@ -152,8 +154,8 @@ func (p *Plugin) Init() error {
 		Lock: &sync.Mutex{},
 		List: make(map[string]uint32),
 	}
-	p.VxlanInstance = 0
 	p.PodConfig = make(map[string]*sync.RWMutex)
+	p.LocalPods = make([]string, 0)
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -176,8 +178,10 @@ func (p *Plugin) Init() error {
 		p.LocalHostName = local_hostname
 	}
 
-	p.get_node_infos(p.LocalHostName)
+	go p.get_node_infos(p.LocalHostName)
+	go p.watch_assignment(context.Background())
 	p.generate_etcd_config()
+	p.generate_vppagent_config()
 
 	go p.watch_topology(context.Background())
 	go p.watch_pods_creation(context.Background())
@@ -190,7 +194,7 @@ func (p *Plugin) String() string {
 }
 
 func (p *Plugin) Close() error {
-	p.clear_socket()
+	p.clear_directory()
 	return nil
 }
 
@@ -228,6 +232,69 @@ func (p Plugin) generate_etcd_config() error {
 	return nil
 }
 
+func (p Plugin) generate_vppagent_config() error {
+	ip_cmd := `
+
+	if [ ! -d "/opt/vpp-agent" ]; then
+		mkdir /opt/vpp-agent
+		cd /opt/vpp-agent
+		touch vpp-agent.conf
+		chmod 777 vpp-agent.conf
+		echo "health-check-probe-interval: 3000000000" >> vpp-agent.conf
+		echo "health-check-reply-timeout: 500000000" >> vpp-agent.conf
+		echo "health-check-threshold: 10" >> vpp-agent.conf
+		echo "reply-timeout: 3000000000" >> vpp-agent.conf
+	fi`
+	cmd := exec.Command("bash", "-c", ip_cmd)
+	cmd.Run()
+
+	p.Log.Infoln("set vpp-agent.conf!")
+
+	return nil
+}
+
+func (p *Plugin) watch_assignment(ctx context.Context) error {
+	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/assignment/", clientv3.WithPrefix())
+
+	receive_count := 0
+	for {
+		select {
+		case <-time.After(TIMEOUT):
+			if receive_count > 0 {
+				p.create_directory()
+				p.inform_finished("DirectoryCreationFinished")
+				receive_count = 0
+			}
+		case <-ctx.Done():
+			return nil
+		case resp := <-watchChan:
+			receive_count += 1
+			err := resp.Err()
+			if err != nil {
+				return err
+			}
+			for _, ev := range resp.Events {
+				if ev.IsCreate() {
+					p.parse_assignment(*ev)
+				}
+			}
+		}
+	}
+}
+
+func (p *Plugin) create_directory() {
+	for _, podname := range p.LocalPods {
+		os.MkdirAll(p.DirPrefix+podname, 0777)
+	}
+}
+
+func (p *Plugin) parse_assignment(event clientv3.Event) {
+	parse_result := strings.Split(string(event.Kv.Value), ",")
+	if strings.Split(parse_result[1], ":")[1] == p.LocalHostName {
+		p.LocalPods = append(p.LocalPods, strings.Split(parse_result[0], ":")[1])
+	}
+}
+
 func (p *Plugin) watch_topology(ctx context.Context) error {
 	ctx1, cancel := context.WithTimeout(context.Background(), TIMEOUT)
 	defer cancel()
@@ -241,14 +308,15 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 
 	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/link/", clientv3.WithPrefix(), clientv3.WithRev(getResp.Header.Revision+1))
 
+	receive_count := 0
 	for {
-		receive_count := 0
 		select {
-		case <-time.After(3 * time.Second):
+		case <-time.After(TIMEOUT):
 			if receive_count > 0 {
 				//p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
 				//p.Log.Infoln("p.MocknetTopology.links =", p.MocknetTopology.links)
 				p.inform_finished("ParseTopologyInfo")
+				receive_count = 0
 			}
 		case <-ctx.Done():
 			return nil
@@ -263,10 +331,6 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 					//p.Log.Infoln("receive a link infomation, key =", string(ev.Kv.Key), ", value =", string(ev.Kv.Value))
 					p.translate(*ev)
 					p.topology_make()
-				} else if ev.IsModify() {
-
-				} else if ev.Type == 1 { // 1 present DELETE
-
 				}
 			}
 		}
@@ -274,12 +338,8 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 }
 
 func (p *Plugin) inform_finished(event string) error {
-	hostname, err := os.Hostname()
-	if err != nil {
-		panic(err)
-	}
 	kv := clientv3.NewKV(p.MasterEtcdClient)
-	kv.Put(context.Background(), "/mocknet/"+event+"/"+hostname, "done")
+	kv.Put(context.Background(), "/mocknet/"+event+"/"+p.LocalHostName, "done")
 	p.Log.Infoln("informed the master that finished event", event)
 	return nil
 }
@@ -379,7 +439,7 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 				if ev.IsCreate() {
 					parse_result := parse_pod_info(*ev)
 					p.PodConfig[parse_result.name] = &sync.RWMutex{}
-					//p.Log.Infoln("receive pod message for", parse_result.name)
+					p.Log.Infoln("receive new create pod message for", parse_result.name)
 					p.PodInfos.Lock.Lock()
 					//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
 					p.PodInfos.List[parse_result.name] = parse_result
@@ -388,19 +448,18 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 					p.Set_Create_Pod(parse_result)
 				} else if ev.IsModify() {
 					parse_result := parse_pod_info(*ev)
+					p.Log.Infoln("receive restart pod message for", parse_result.name)
 					p.PodInfos.Lock.Lock()
 					//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
 					p.PodInfos.List[parse_result.name] = parse_result
 					p.PodInfos.Lock.Unlock()
 					//p.Log.Infoln(parse_result.name, "has released the lock of PodInfos")
-					split_info := strings.Split(string(ev.Kv.Value), ",")
-					old_restart_count, err := strconv.Atoi(strings.Split(split_info[5], ":")[1])
 					if err != nil {
 						panic("restart count is invalid")
 					}
-					if parse_result.restartcount > old_restart_count {
-						p.Set_Recreate_Pod(parse_result)
-					}
+
+					// to be convenient, assume that if value changes, mean restart of the pod
+					p.Set_Recreate_Pod(parse_result)
 				}
 			}
 		}
@@ -408,114 +467,177 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 }
 
 func (p *Plugin) Set_Create_Pod(parse_result podinfo) error {
+	p.assign_dir_to_pod(parse_result.name)
+	//p.Log.Infoln("parse result =", parse_result)
 	pod := p.MocknetTopology.pods[parse_result.name]
+	//p.Log.Infoln("pod =", pod)
 	if p.Is_Local(pod.name) {
-		p.Log.Infoln(pod.name, "has got the lock of PodConfig")
+		p.Log.Infoln(pod.name, "is waitting for the lock of PodConfig")
 		p.PodConfig[pod.name].Lock()
-		p.Log.Infoln("pod", pod.name, "is local, so start to config it")
-		p.Completed_Config(*pod)
-		p.Set_Connection(*pod)
+		p.Log.Infoln(pod.name, "has got the lock of PodConfig")
+		//p.Log.Infoln("pod", pod.name, "is local, so start to config it")
+		if p.Completed_Config(*pod) {
+			p.Set_Connection(*pod)
+		}
 	}
 
 	return nil
 }
 
 func (p *Plugin) Set_Recreate_Pod(parse_result podinfo) error {
+	//p.assign_dir_to_pod(parse_result.name)
 	pod := p.MocknetTopology.pods[parse_result.name]
 	if p.Is_Local(pod.name) {
-		p.Log.Infoln("receive a restart signal for local pod", parse_result.name, ", start to reconfig it")
+		p.Log.Warningln("received a restart signal fo pod", parse_result.name)
+		p.Log.Infoln("start to reconfig pod", parse_result.name)
+		p.PodConfig[pod.name].Lock()
+		p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
 		p.Clear_Completed_Config(*pod)
-		p.Completed_Config(*pod)
-		p.Set_Connection(*pod)
+		if p.Completed_Config(*pod) {
+			p.Set_Connection(*pod)
+		}
 	}
 
 	return nil
 }
 
-func (p *Plugin) Completed_Config(pod Pod) error {
+func (p *Plugin) Completed_Config(pod Pod) bool {
 	// create memif socket
-	p.assign_dir_to_pod(pod.name)
 	id := p.get_socket_id(pod.name) + 1
-	p.Log.Infoln("pod name:", pod.name)
 	filedir := p.DirPrefix + pod.name
 	p.Vpp.CreateSocket(uint32(id), filedir)
 
 	// create memif interface
 	pod.alloc_interface_id()
+	// if any wrong, set it to false and skip any config of the pod
+	var pod_memif_id uint32
+	var vppresult vpp.ProcessResult
+	var linuxresult linux.ProcessResult
 
 	for _, vpp_id := range pod.infs {
 		// host-side
-		global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id))
-		p.Vpp.Set_interface_state_up(global_id)
-		p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
-		p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
-		p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
+		if result, global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id)); result == vpp.Success {
+			p.Vpp.Set_interface_state_up(global_id)
+			p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
+			p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
+			p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
+		} else {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
 
 		// pod-side
 		inf_name := "memif" + strconv.Itoa(vpp_id)
 		// int_id is the id in a socket used to identify peer(slave or master)
-		pod_int_id := p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
-		p.Vpp.Pod_Set_interface_state_up(pod.name, pod_int_id)
+		vppresult, pod_memif_id = p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
+		if vppresult == vpp.Success {
+			p.Vpp.Pod_Set_interface_state_up(pod.name, pod_memif_id)
+		} else {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
 	}
 
 	// write pod-vpp-tap to pod-vpp-memif route
-	if string([]byte(pod.name)[:1]) == "h" {
-		// probe weather tap0 interface exist
-		result, tap_id := p.Vpp.Pod_Create_Tap(pod.name)
-		if result {
+	if strings.Contains(pod.name, "h") {
+		p.PodInfos.Lock.Lock()
+		containerid := p.PodInfos.List[pod.name].containerid
+		podip := p.PodInfos.List[pod.name].podip
+		p.PodInfos.Lock.Unlock()
+
+		var tap_id uint32
+		if vppresult, tap_id = p.Vpp.Pod_Create_Tap(pod.name); vppresult == vpp.Success {
 			p.Vpp.Pod_Set_interface_state_up(pod.name, uint32(tap_id))
-			// recreate tap interface successfully, need to config it
-			p.MasterEtcdClient.Put(context.Background(), "/mocknet/PodTapReCofiguration-"+pod.name, pod.name)
-			p.wait_for_response("PodTapConfigFinished-" + pod.name)
+			if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
+				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+				p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+				p.PodConfig[pod.name].Unlock()
+				p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+				return false
+			}
+			if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
+				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+				p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+				p.PodConfig[pod.name].Unlock()
+				p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+				return false
+			}
 		} else {
-			tap_id = 1
-			p.Vpp.Pod_Set_interface_state_up(pod.name, 1)
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
 		}
 
 		// write pod-vpp to pod pod-linux route
-		p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
+		if vppresult = p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
 			Dst: vpp.IpNet{
 				Ip:   p.PodInfos.List[pod.name].podip,
 				Mask: 32,
 			},
 			Dev:   "tap0",
 			DevId: uint32(tap_id),
-		})
-		p.Vpp.Pod_Xconnect(pod.name, 1, 2)
-		p.Vpp.Pod_Xconnect(pod.name, 2, 1)
+		}); vppresult == vpp.Success {
+			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, tap_id)
+			p.Vpp.Pod_Xconnect(pod.name, tap_id, pod_memif_id)
+		} else {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
 
-	} else if string([]byte(pod.name)[:1]) == "s" {
+	} else if strings.Contains(pod.name, "s") {
 		// bridge interfaces in switch pod together
 		ints_id := make([]uint32, 0)
 		for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
 			ints_id = append(ints_id, uint32(i+1))
 		}
-		p.Vpp.Pod_Bridge(pod.name, ints_id, 1)
-
+		if vppresult = p.Vpp.Pod_Bridge(pod.name, ints_id, 1); vppresult != vpp.Success {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
 	} else {
-		p.Log.Errorln("the judgement character is ", string([]byte(pod.name)[:1]))
+		p.Log.Errorln("the judgement name is ", pod.name)
 		panic("pod type judgement error!")
 	}
-	return nil
+	return true
 }
 
 func (p *Plugin) Clear_Completed_Config(pod Pod) error {
-	id := p.get_socket_id(pod.name) + 1
-	p.Vpp.DeleteSocket(uint32(id))
+	/*id := p.get_socket_id(pod.name) + 1
+	p.Vpp.DeleteSocket(uint32(id))*/
 
+	p.Log.Infoln("deleting host-side memif interface for pod", pod.name)
 	for _, vpp_id := range pod.infs {
 		memif_int_id := p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)]
 		p.Vpp.Delete_Memif_Interface(memif_int_id)
 	}
 
-	p.VxlanInstance = 0
-	for int_name, vpp_id := range p.IntToVppId.List {
+	// no need to delete vxlan tunnel
+	/*for int_name, vpp_id := range p.IntToVppId.List {
 		if strings.Split(int_name, "-")[1] == pod.name {
 			p.Vpp.Delete_Vxlan_Tunnel(vpp_id)
 		}
-	}
+	}*/
 
 	return nil
+}
+
+type Vxlan_Count_Sync struct {
+	lock  *sync.RWMutex
+	count int
 }
 
 func (p *Plugin) Set_Connection(pod Pod) error {
@@ -526,66 +648,100 @@ func (p *Plugin) Set_Connection(pod Pod) error {
 		}
 	}
 
-	vxlan_count := 0
+	vxlan_count := Vxlan_Count_Sync{
+		lock:  &sync.RWMutex{},
+		count: 0,
+	}
 	// host-side vpp config
 	for _, link := range pod.links {
-		p.Log.Infoln("the link =", link)
-		if p.Is_Local(link.pod1) && p.Is_Local(link.pod2) {
-			// for both locals, xconnect them together
-			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1], p.IntToVppId.List[link.pod2+"-"+link.pod2inf])
-		} else if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
-			// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
-			src_address := p.Addresses.local_vtep_address
-			vni := uint32(link.vni)
-			p.Log.Infoln("origin vni =", link.vni)
-			go p.Create_Vxlan_And_Connect(link, src_address, link.pod2, vni, p.VxlanInstance, &vxlan_count, vxlan_total)
-			p.VxlanInstance += 1
-		}
+		go p.Connect(link, &vxlan_count, vxlan_total)
 	}
 	return nil
 }
 
-func (p *Plugin) Create_Vxlan_And_Connect(link Link, src string, peer_name string, vni uint32, instance uint32, vxlan_count *int, vxlan_total int) error {
-	var dst_address string
+func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total int) error {
+	var dst, src string
+	var vni uint32
+	var Is_Local1, Is_Local2 bool
+
 	try_count := 0
 	for {
+		hit_flag := false
 		// it means that dst pod's info hasn't been received, wait until it does
 		p.PodInfos.Lock.Lock()
 		p.NodeInfos.Lock.Lock()
 		//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
 		//p.Log.Infoln(link.pod1, "has got the lock of NodeInfos")
-		dst_temp := p.NodeInfos.List[p.PodInfos.List[link.pod2].hostname].vtepip
+
+		pod2host := p.PodInfos.List[link.pod2].hostname
+		p.Log.Infoln(link.pod1, ":    pod2host =", pod2host)
+		if pod2host != "" {
+			dst = p.NodeInfos.List[pod2host].vtepip
+			Is_Local1 = p.Is_Local(link.pod1)
+			Is_Local2 = p.Is_Local(link.pod2)
+			if try_count >= 1 {
+				p.Log.Infoln(link.pod1+"'s", "information request of pod", link.pod2, "has been met")
+			}
+			hit_flag = true
+		}
+
 		p.PodInfos.Lock.Unlock()
 		p.NodeInfos.Lock.Unlock()
 		//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
 		//p.Log.Infoln(link.pod1, "has released the lock of NodeInfos")
-		if dst_temp != "" {
-			dst_address = dst_temp
-			if try_count >= 1 {
-				p.Log.Infoln(link.pod1+"'s", "information request of pod", link.pod1, "has been met")
-			}
+
+		if hit_flag {
 			break
 		}
+
 		// only print once
 		if try_count == 0 {
-			p.Log.Infoln("pod", link.pod1, "is waitting for info of pod", peer_name)
+			p.Log.Infoln("pod", link.pod1, "is waitting for info of pod", link.pod2)
 		}
 		time.Sleep(3 * time.Second)
 		try_count += 1
 	}
-	vxlan_id := p.Vpp.Create_Vxlan_Tunnel(src, dst_address, vni, instance)
-	p.IntToVppId.Lock.Lock()
-	//p.Log.Infoln(link.pod1, "has got the lock of IntToVppId")
-	p.IntToVppId.List["vxlan"+strconv.Itoa(int(instance))+"-"+link.pod1] = vxlan_id
-	p.IntToVppId.Lock.Unlock()
-	//p.Log.Infoln(link.pod1, "has released the lock of IntToVppId")
-	p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], vxlan_id)
-	p.Vpp.XConnect(vxlan_id, p.IntToVppId.List[link.pod1+"-"+link.pod1inf])
-	*vxlan_count += 1
-	if *vxlan_count == vxlan_total {
-		p.PodConfig[link.pod1].Unlock()
-		//p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
-		p.Log.Infoln("-----------", link.pod1, "config finished -----------")
+
+	if Is_Local1 && Is_Local2 {
+		// for both locals, xconnect them together
+		p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1], p.IntToVppId.List[link.pod2+"-"+link.pod2inf])
+	} else if Is_Local1 && !Is_Local2 {
+		// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
+		src = p.Addresses.local_vtep_address
+		vni = uint32(link.vni)
+		vxlan_name := "vxlan" + strconv.Itoa(int(vni))
+		var vxlan_id uint32
+
+		if result, id := p.Vpp.Create_Vxlan_Tunnel(src, dst, vni, vni); result != vpp.TimesOver {
+			if result == vpp.Success {
+				vxlan_id = id
+				p.IntToVppId.Lock.Lock()
+				p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				p.IntToVppId.List[vxlan_name] = vxlan_id
+				p.IntToVppId.Lock.Unlock()
+				p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
+			} else if result == vpp.AlreadyExist {
+				p.IntToVppId.Lock.Lock()
+				p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				vxlan_id = p.IntToVppId.List[vxlan_name]
+				p.IntToVppId.Lock.Unlock()
+				p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
+			}
+			p.IntToVppId.Lock.Lock()
+			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], vxlan_id)
+			p.Vpp.XConnect(vxlan_id, p.IntToVppId.List[link.pod1+"-"+link.pod1inf])
+			p.IntToVppId.Lock.Unlock()
+		}
+		vxlan_count.lock.Lock()
+		vxlan_count.count += 1
+		p.Log.Infoln("now vxlan_count =", vxlan_count.count, "total =", vxlan_total)
+		if vxlan_count.count == vxlan_total {
+			p.Log.Infoln(link.pod1, "is going to release the lock of PodConfig")
+			p.PodConfig[link.pod1].Unlock()
+			p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
+			p.Log.Infoln("---------------- config for", link.pod1, "finished ----------------")
+		}
+		vxlan_count.lock.Unlock()
 	}
 
 	return nil
@@ -598,6 +754,7 @@ func parse_pod_info(event clientv3.Event) podinfo {
 	if err != nil {
 		panic("restart count is invalid")
 	}
+	//fmt.Println("name=", strings.Split(split_info[0], ":")[1], ", dockerid=", strings.Split(split_info[6], ":")[1])
 	return podinfo{
 		name:         strings.Split(split_info[0], ":")[1],
 		namespace:    strings.Split(split_info[1], ":")[1],
@@ -605,6 +762,7 @@ func parse_pod_info(event clientv3.Event) podinfo {
 		hostip:       strings.Split(split_info[3], ":")[1],
 		hostname:     strings.Split(split_info[4], ":")[1],
 		restartcount: restart_count,
+		containerid:  strings.Split(split_info[6], ":")[1],
 	}
 }
 
@@ -618,7 +776,6 @@ func (p *Plugin) Is_Local(name string) bool {
 
 func (p *Plugin) assign_dir_to_pod(name string) error {
 	p.DirAssign = append(p.DirAssign, name)
-	os.MkdirAll(p.DirPrefix+name, 0777)
 	return nil
 }
 
@@ -644,14 +801,20 @@ func (pod Pod) alloc_interface_id() error {
 	return nil
 }
 
-func (p *Plugin) clear_socket() error {
+func (p *Plugin) clear_directory() error {
 	dir, err := ioutil.ReadDir(p.DirPrefix)
 	if err != nil {
 		panic(err)
 	}
 
-	for _, d := range dir {
-		os.RemoveAll(path.Join([]string{p.DirPrefix, d.Name()}...))
+	for _, pod := range dir {
+		pod_dir, err := ioutil.ReadDir(p.DirPrefix + pod.Name())
+		if err != nil {
+			panic(err)
+		}
+		for _, d := range pod_dir {
+			os.RemoveAll(path.Join([]string{p.DirPrefix, pod.Name(), d.Name()}...))
+		}
 	}
 	return nil
 }
@@ -824,58 +987,6 @@ func (p *Plugin) pod_vpp_core_bind() error {
 			panic(err)
 		} else {
 			p.Log.Infoln("created pod vpp config file")
-		}
-	}
-	return nil
-}
-
-func (p *Plugin) host_vpp_core_bind() error {
-	vppconf :=
-		`
-unix {
-	nodaemon
-	log /var/log/vpp/vpp.log
-	full-coredump
-	cli-listen /run/vpp/cli.sock
-	gid vpp
-  }
-  
-  api-trace {
-	on
-  }
-  
-  api-segment {
-	gid vpp
-  }
-  
-  socksvr {
-	default
-  }
-  
-  cpu {
-	skip-cores 1
-	workers 1
-	scheduler-policy fifo
-	scheduler-priority 50
-  }
-`
-	_, err := os.Stat(HOST_VPP_CONFIG_FILE)
-	if err == nil {
-		os.Remove(HOST_VPP_CONFIG_FILE)
-	}
-	f, err := os.Create(HOST_VPP_CONFIG_FILE)
-	if err != nil {
-		panic(err)
-	}
-	defer f.Close()
-	if err != nil {
-		panic(err)
-	} else {
-		_, err = f.Write([]byte(vppconf))
-		if err != nil {
-			panic(err)
-		} else {
-			p.Log.Infoln("created host vpp config file")
 		}
 	}
 	return nil

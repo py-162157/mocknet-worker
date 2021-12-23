@@ -1,12 +1,32 @@
 package linux
 
 import (
+	"bytes"
 	"net"
+	"os/exec"
 	"strconv"
 	"strings"
+	"time"
+
+	"mocknet/plugins/vpp"
 
 	"github.com/vishvananda/netlink"
 	"go.ligato.io/cn-infra/v2/logging"
+)
+
+type ProcessResult string
+
+const (
+	AlreadyExist ProcessResult = "AlreadyExist"
+	TimesOver    ProcessResult = "TimesOver"
+	Success      ProcessResult = "Success"
+	NotExist     ProcessResult = "NotExist"
+	Failed       ProcessResult = "Failed"
+)
+
+const (
+	MAX_RETRY_TIMES     = 3
+	RETRY_TIME_INTERVAL = 1 * time.Second
 )
 
 type Plugin struct {
@@ -19,6 +39,7 @@ type Plugin struct {
 type Deps struct {
 	Log             logging.PluginLogger
 	HostMainDevName string
+	Vpp             *vpp.Plugin
 }
 
 func (p *Plugin) Init() error {
@@ -60,7 +81,7 @@ type IpNet struct {
 	Mask uint
 }
 
-func (p *Plugin) Add_Route(route Route_Info) error {
+func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 	//p.Log.Infoln("dst:", route.Dst, "gw:", route.Gw, "dev:", route.Dev)
 	req := &netlink.Route{
 		Dst:       route.Dst.IpNetToStd(),
@@ -87,27 +108,26 @@ func (p *Plugin) Add_Route(route Route_Info) error {
 			p.Log.Warningln("route already exist, so automaticly delete it and retry again")
 			p.Del_Route(route)
 			p.Add_Route(route)
+			return AlreadyExist
 		} else {
-			panic(err)
+			return TimesOver
 		}
 	} else {
 		p.Log.Infoln("added a route to linux namespace!")
+		return Success
 	}
-
-	return nil
 }
 
-func (p *Plugin) Del_Route(route Route_Info) error {
+func (p *Plugin) Del_Route(route Route_Info) ProcessResult {
 	err := p.LinuxHandler.RouteDel(&netlink.Route{
 		Dst: route.Dst.IpNetToStd(),
 	})
 	if err != nil {
 		p.Log.Errorln("delete route failed")
-		panic(err)
+		return TimesOver
 	}
 	p.Log.Infoln("delete route for destination", route.Dst.Ip)
-
-	return nil
+	return Success
 }
 
 func (mynet IpNet) IpNetToStd() *net.IPNet {
@@ -163,5 +183,57 @@ func (p *Plugin) get_host_main_net_dev() {
 			p.HostMainDevName = dev.Attrs().Name
 			break
 		}
+	}
+}
+
+func (p *Plugin) Pod_Add_Route(container_id string, pod_name string) ProcessResult {
+	var stderr bytes.Buffer
+	cmd := exec.Command("docker", "exec", container_id, "ip", "route", "add", "10.1.0.0/16", "dev", "tap0")
+	cmd.Stderr = &stderr
+
+	count := 0
+	for {
+		err := cmd.Run()
+		if err == nil {
+			p.Log.Infoln("added route for pod", pod_name)
+			return Success
+		} else {
+			if count >= MAX_RETRY_TIMES {
+				p.Log.Errorln("max retry times up to add route for pod", pod_name)
+				return TimesOver
+			} else {
+				p.Log.Warningln("failed to add route for pod", pod_name, "err:", stderr.String(), "retry")
+				if result, tap_id := p.Vpp.Pod_Create_Tap(pod_name); result == vpp.Success || result == vpp.AlreadyExist {
+					p.Vpp.Pod_Set_interface_state_up(pod_name, tap_id)
+				}
+			}
+		}
+		count += 1
+		time.Sleep(RETRY_TIME_INTERVAL)
+	}
+}
+
+func (p *Plugin) Pod_Set_Ip(container_id string, pod_name string, ip string) ProcessResult {
+	var stderr bytes.Buffer
+	cpip := strings.Split(ip, ".") // conrol plane ip
+	data_plane_ip := "10.1." + cpip[2] + "." + cpip[3] + "/16"
+	cmd := exec.Command("docker", "exec", container_id, "ip", "addr", "add", "dev", "tap0", data_plane_ip)
+	cmd.Stderr = &stderr
+
+	count := 0
+	for {
+		err := cmd.Run()
+		if err == nil {
+			p.Log.Infoln("set ip address for pod", pod_name)
+			return Success
+		} else {
+			if count >= MAX_RETRY_TIMES {
+				p.Log.Errorln("max retry times up to set ip address for pod", pod_name)
+				return TimesOver
+			}
+			p.Log.Warningln("failed to set ip address for pod", pod_name, "err:", stderr.String(), "retry")
+		}
+		count += 1
+		time.Sleep(RETRY_TIME_INTERVAL)
 	}
 }

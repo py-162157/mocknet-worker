@@ -45,6 +45,7 @@ func main() {
 	}))
 
 	LinuxPlugin := linux.NewPlugin(linux.UseDeps(func(deps *linux.Deps) {
+		deps.Vpp = VppPlugin
 	}))
 
 	ControllerPlugin := controller.NewPlugin(controller.UseDeps(func(deps *controller.Deps) {
