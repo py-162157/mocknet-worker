@@ -551,24 +551,14 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		podip := p.PodInfos.List[pod.name].podip
 		p.PodInfos.Lock.Unlock()
 
-		var tap_id uint32
-		if vppresult, tap_id = p.Vpp.Pod_Create_Tap(pod.name); vppresult == vpp.Success {
-			p.Vpp.Pod_Set_interface_state_up(pod.name, uint32(tap_id))
-			if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
-				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-				p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-				p.PodConfig[pod.name].Unlock()
-				p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-				return false
-			}
-			if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
-				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-				p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-				p.PodConfig[pod.name].Unlock()
-				p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-				return false
-			}
-		} else {
+		if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
+		if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
@@ -583,10 +573,10 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 				Mask: 32,
 			},
 			Dev:   "tap0",
-			DevId: uint32(tap_id),
+			DevId: uint32(1),
 		}); vppresult == vpp.Success {
-			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, tap_id)
-			p.Vpp.Pod_Xconnect(pod.name, tap_id, pod_memif_id)
+			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, 1)
+			p.Vpp.Pod_Xconnect(pod.name, 1, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
@@ -854,85 +844,30 @@ func (p *Plugin) get_node_infos(local_hostname string) error {
 			p.Addresses.local_vtep_address = vtepip
 			p.Addresses.host_net_addr_24 = get_ip_net_24(nodeip)
 
-			p.Vpp.Create_Tap()
 			p.Vpp.Set_interface_state_up(1)
 			p.Vpp.Set_Interface_Ip(1, vpp.IpNet{
 				Ip:   vtepip,
 				Mask: 24,
 			})
-			p.Linux.Add_Route(linux.Route_Info{
-				Dst: linux.IpNet{
-					Ip:   vtepip,
-					Mask: 32,
-				},
-				Dev: "tap0",
-			})
-			p.Vpp.Add_Route(vpp.Route_Info{
-				Dst: vpp.IpNet{
-					Ip:   nodeip,
-					Mask: 32,
-				},
-				Dev:   "tap0",
-				DevId: 1,
-			})
 		} else if name == "master" {
 			p.Addresses.master_ip_address = nodeip
 		}
 	}
-
 	for _, nodekv := range resp.Kvs {
 		split_value := strings.Split(string(nodekv.Value), ",")
 		name := strings.Split(split_value[0], ":")[1]
-		nodeip := strings.Split(split_value[1], ":")[1]
 		vtepip := strings.Split(split_value[2], ":")[1]
 		if name != local_hostname && name != "master" {
-			// route to other worker vtep interface
-			p.Linux.Add_Route(linux.Route_Info{
-				Dst: linux.IpNet{
-					Ip:   vtepip,
-					Mask: 32,
-				},
-				Gw: linux.IpNet{
-					Ip: nodeip,
-				},
-				Dev: p.Linux.HostMainDevName,
-			})
-			p.Vpp.Add_Route(vpp.Route_Info{
-				Dst: vpp.IpNet{
-					Ip:   nodeip,
-					Mask: 32,
-				},
-				Gw: vpp.IpNet{
-					Ip:   p.Addresses.local_ip_address,
-					Mask: 32,
-				},
-				Dev:   "tap0",
-				DevId: 1,
-			})
 			p.Vpp.Add_Route(vpp.Route_Info{
 				Dst: vpp.IpNet{
 					Ip:   vtepip,
 					Mask: 32,
 				},
-				Gw: vpp.IpNet{
-					Ip:   p.Addresses.local_ip_address,
-					Mask: 32,
-				},
-				Dev:   "tap0",
+				Dev:   "temp_vetp_name",
 				DevId: 1,
 			})
 		}
 	}
-
-	// route from host-vpp to local host linux namespace
-	p.Vpp.Add_Route(vpp.Route_Info{
-		Dst: vpp.IpNet{
-			Ip:   p.Addresses.host_net_addr_24,
-			Mask: 24,
-		},
-		Dev:   "tap0",
-		DevId: 1,
-	})
 	p.Log.Infoln("----------- configure for nodes finished -----------")
 
 	return nil
