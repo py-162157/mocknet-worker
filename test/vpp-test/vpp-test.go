@@ -42,20 +42,18 @@ import (
 	ip_types_2110 "mocknet/binapi/vpp2110/ip_types"
 	memif_2110 "mocknet/binapi/vpp2110/memif"
 	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
-
-	"git.fd.io/govpp.git/core"
 )
 
 var (
-	sockAddr = flag.String("sock", "/run/vpp/api.sock", "Path to VPP binary API socket file")
-	//sockAddr = flag.String("sock", "/var/run/mocknet/h1s2/api.sock", "Path to VPP binary API socket file")
+	//sockAddr = flag.String("sock", "/run/vpp/api.sock", "Path to VPP binary API socket file")
+	sockAddr = flag.String("sock", "/var/run/mocknet/h1s2/api.sock", "Path to VPP binary API socket file")
 )
 
 func main() {
 	flag.Parse()
 
 	// connect to VPP asynchronously
-	conn, conev, err := govpp.AsyncConnect(*sockAddr, core.DefaultMaxReconnectAttempts, core.DefaultReconnectInterval)
+	conn, err := govpp.Connect(*sockAddr)
 	//vppclient := conn.VppClient
 	if err != nil {
 		log.Fatalln("ERROR:", err)
@@ -69,12 +67,6 @@ func main() {
 	defer conn.Disconnect()
 
 	// wait for Connected event
-	select {
-	case e := <-conev:
-		if e.State != core.Connected {
-			log.Fatalln("ERROR: connecting to VPP failed:", e.Error)
-		}
-	}
 
 	// create an API channel that will be used in the examples
 	ch, err := conn.NewAPIChannel()
@@ -93,7 +85,7 @@ func main() {
 	//ipAddressDump(ch)
 
 	//interfaceNotifications(ch)
-	//CreateSocket(ch)
+	CreateSocket(ch)
 	//CreateMemifInterface(ch)
 	//interface_state(ch)
 	//create_vxlan_tunnel(ch)
@@ -104,7 +96,7 @@ func main() {
 	//Add_Route(ch)
 	//Create_Tap(ch)
 	//Delete_Vxlan_Tunnel(ch)
-	Delete_Memif_Interface(ch)
+	//Delete_Memif_Interface(ch)
 
 	/*if err := ch.CheckCompatiblity(memif_2110.AllMessages()...); err != nil {
 		fmt.Println("error!", err)
@@ -143,7 +135,7 @@ func CreateSocket(ch api.Channel) {
 	req := &memif_2110.MemifSocketFilenameAddDel{
 		IsAdd:          true,
 		SocketID:       5,
-		SocketFilename: "/home/ubuntu/test.sock",
+		SocketFilename: "/home/test.sock",
 	}
 	reply := &memif_2110.MemifSocketFilenameAddDelReply{}
 

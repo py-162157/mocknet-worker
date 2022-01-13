@@ -203,8 +203,10 @@ func (p *Plugin) Pod_Add_Route(container_id string, pod_name string) ProcessResu
 				return TimesOver
 			} else {
 				p.Log.Warningln("failed to add route for pod", pod_name, "err:", stderr.String(), "retry")
-				if result, tap_id := p.Vpp.Pod_Create_Tap(pod_name); result == vpp.Success || result == vpp.AlreadyExist {
-					p.Vpp.Pod_Set_interface_state_up(pod_name, tap_id)
+				if strings.Contains(stderr.String(), "find") { // can't find device tap0
+					if result, tap_id := p.Vpp.Pod_Create_Tap(pod_name); result == vpp.Success || result == vpp.AlreadyExist {
+						p.Vpp.Pod_Set_interface_state_up(pod_name, tap_id)
+					}
 				}
 			}
 		}

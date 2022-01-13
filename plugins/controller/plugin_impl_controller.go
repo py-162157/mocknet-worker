@@ -4,7 +4,6 @@ import (
 	"context"
 	"io/ioutil"
 	"os"
-	"os/exec"
 	"path"
 	"strconv"
 	"strings"
@@ -180,10 +179,23 @@ func (p *Plugin) Init() error {
 
 	go p.get_node_infos(p.LocalHostName)
 	go p.watch_assignment(context.Background())
-	p.generate_etcd_config()
-	p.generate_vppagent_config()
+	//p.generate_etcd_config()
 
 	go p.watch_topology(context.Background())
+
+	for {
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/ParseTopologyInfo/"+p.LocalHostName)
+		if err != nil {
+			p.Log.Errorln("failed to probe ParseTopologyInfo event")
+		} else {
+			if len(resp.Kvs) != 0 {
+				if string(resp.Kvs[0].Value) == "done" {
+					break
+				}
+			}
+		}
+	}
+
 	go p.watch_pods_creation(context.Background())
 
 	return nil
@@ -207,49 +219,6 @@ func (p *Plugin) create_work_directory(dir string) error {
 	if os.IsNotExist(err) {
 		os.MkdirAll(p.DirPrefix, 0777)
 	}
-	return nil
-}
-
-func (p Plugin) generate_etcd_config() error {
-	ip_cmd := `NODE_IP="$(ifconfig -a|grep inet|grep -v 127.0.0.1|grep -v inet6|grep 192|awk '{print $2}'|tr -d "addr:"​)"
-
-	if [ ! -d "/opt/etcd" ]; then
-		mkdir /opt/etcd
-		cd /opt/etcd
-		touch etcd.conf
-		chmod 777 etcd.conf
-		echo "insecure-transport: true" >> etcd.conf
-		echo "dial-timeout: 10000000000" >> etcd.conf
-		echo "allow-delayed-start: true" >> etcd.conf
-		echo "endpoints:" >> etcd.conf
-		echo "  - "${NODE_IP}:32379"" >> etcd.conf
-	fi`
-	cmd := exec.Command("bash", "-c", ip_cmd)
-	cmd.Run()
-
-	p.Log.Infoln("set etcd.conf!")
-
-	return nil
-}
-
-func (p Plugin) generate_vppagent_config() error {
-	ip_cmd := `
-
-	if [ ! -d "/opt/vpp-agent" ]; then
-		mkdir /opt/vpp-agent
-		cd /opt/vpp-agent
-		touch vpp-agent.conf
-		chmod 777 vpp-agent.conf
-		echo "health-check-probe-interval: 3000000000" >> vpp-agent.conf
-		echo "health-check-reply-timeout: 500000000" >> vpp-agent.conf
-		echo "health-check-threshold: 10" >> vpp-agent.conf
-		echo "reply-timeout: 3000000000" >> vpp-agent.conf
-	fi`
-	cmd := exec.Command("bash", "-c", ip_cmd)
-	cmd.Run()
-
-	p.Log.Infoln("set vpp-agent.conf!")
-
 	return nil
 }
 
@@ -469,12 +438,13 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 func (p *Plugin) Set_Create_Pod(parse_result podinfo) error {
 	p.assign_dir_to_pod(parse_result.name)
 	//p.Log.Infoln("parse result =", parse_result)
-	pod := p.MocknetTopology.pods[parse_result.name]
 	//p.Log.Infoln("pod =", pod)
-	if p.Is_Local(pod.name) {
+	if p.Is_Local(parse_result.name) {
+		p.Log.Infoln("pod", parse_result.name, "is local")
+		pod := p.MocknetTopology.pods[parse_result.name]
 		p.Log.Infoln(pod.name, "is waitting for the lock of PodConfig")
 		p.PodConfig[pod.name].Lock()
-		p.Log.Infoln(pod.name, "has got the lock of PodConfig")
+		//p.Log.Infoln(pod.name, "has got the lock of PodConfig")
 		//p.Log.Infoln("pod", pod.name, "is local, so start to config it")
 		if p.Completed_Config(*pod) {
 			p.Set_Connection(*pod)
@@ -491,7 +461,7 @@ func (p *Plugin) Set_Recreate_Pod(parse_result podinfo) error {
 		p.Log.Warningln("received a restart signal fo pod", parse_result.name)
 		p.Log.Infoln("start to reconfig pod", parse_result.name)
 		p.PodConfig[pod.name].Lock()
-		p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
+		//p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
 		p.Clear_Completed_Config(*pod)
 		if p.Completed_Config(*pod) {
 			p.Set_Connection(*pod)
@@ -509,7 +479,7 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 
 	// create memif interface
 	pod.alloc_interface_id()
-	// if any wrong, set it to false and skip any config of the pod
+
 	var pod_memif_id uint32
 	var vppresult vpp.ProcessResult
 	var linuxresult linux.ProcessResult
@@ -523,9 +493,9 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 			p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 
@@ -537,9 +507,9 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 			p.Vpp.Pod_Set_interface_state_up(pod.name, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 	}
@@ -551,18 +521,33 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		podip := p.PodInfos.List[pod.name].podip
 		p.PodInfos.Lock.Unlock()
 
+		var tap_id uint32
+		if vppresult, tap_id = p.Vpp.Pod_Create_Tap(pod.name); vppresult != vpp.Success {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
+		if vppresult = p.Vpp.Pod_Set_interface_state_up(pod.name, tap_id); vppresult != vpp.Success {
+			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			p.PodConfig[pod.name].Unlock()
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			return false
+		}
 		if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 		if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 
@@ -575,13 +560,13 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 			Dev:   "tap0",
 			DevId: uint32(1),
 		}); vppresult == vpp.Success {
-			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, 1)
-			p.Vpp.Pod_Xconnect(pod.name, 1, pod_memif_id)
+			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, tap_id)
+			p.Vpp.Pod_Xconnect(pod.name, tap_id, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 
@@ -593,9 +578,9 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		}
 		if vppresult = p.Vpp.Pod_Bridge(pod.name, ints_id, 1); vppresult != vpp.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
 			p.PodConfig[pod.name].Unlock()
-			p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 	} else {
@@ -615,7 +600,7 @@ func (p *Plugin) Clear_Completed_Config(pod Pod) error {
 		p.Vpp.Delete_Memif_Interface(memif_int_id)
 	}
 
-	// no need to delete vxlan tunnel
+	// no need to delete vxlan tunnel for now
 	/*for int_name, vpp_id := range p.IntToVppId.List {
 		if strings.Split(int_name, "-")[1] == pod.name {
 			p.Vpp.Delete_Vxlan_Tunnel(vpp_id)
@@ -664,7 +649,7 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 		//p.Log.Infoln(link.pod1, "has got the lock of NodeInfos")
 
 		pod2host := p.PodInfos.List[link.pod2].hostname
-		p.Log.Infoln(link.pod1, ":    pod2host =", pod2host)
+		//p.Log.Infoln(link.pod1, ":    pod2host =", pod2host)
 		if pod2host != "" {
 			dst = p.NodeInfos.List[pod2host].vtepip
 			Is_Local1 = p.Is_Local(link.pod1)
@@ -694,7 +679,7 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 
 	if Is_Local1 && Is_Local2 {
 		// for both locals, xconnect them together
-		p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1], p.IntToVppId.List[link.pod2+"-"+link.pod2inf])
+		go p.direct_xconnect(link)
 	} else if Is_Local1 && !Is_Local2 {
 		// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
 		src = p.Addresses.local_vtep_address
@@ -706,16 +691,16 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 			if result == vpp.Success {
 				vxlan_id = id
 				p.IntToVppId.Lock.Lock()
-				p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
 				p.IntToVppId.List[vxlan_name] = vxlan_id
 				p.IntToVppId.Lock.Unlock()
-				p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
 			} else if result == vpp.AlreadyExist {
 				p.IntToVppId.Lock.Lock()
-				p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
 				vxlan_id = p.IntToVppId.List[vxlan_name]
 				p.IntToVppId.Lock.Unlock()
-				p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
 			}
 			p.IntToVppId.Lock.Lock()
 			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], vxlan_id)
@@ -726,14 +711,29 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 		vxlan_count.count += 1
 		p.Log.Infoln("now vxlan_count =", vxlan_count.count, "total =", vxlan_total)
 		if vxlan_count.count == vxlan_total {
-			p.Log.Infoln(link.pod1, "is going to release the lock of PodConfig")
+			//p.Log.Infoln(link.pod1, "is going to release the lock of PodConfig")
 			p.PodConfig[link.pod1].Unlock()
-			p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
+			//p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
 			p.Log.Infoln("---------------- config for", link.pod1, "finished ----------------")
 		}
 		vxlan_count.lock.Unlock()
 	}
 
+	return nil
+}
+
+func (p *Plugin) direct_xconnect(link Link) error {
+	for {
+		p.IntToVppId.Lock.Lock()
+		intf2_id, ok := p.IntToVppId.List[link.pod2+"-"+link.pod2inf]
+		p.IntToVppId.Lock.Unlock()
+		// waitting for the pod2's memif interface to be created
+		if ok {
+			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], intf2_id)
+			break
+		}
+		time.Sleep(time.Second)
+	}
 	return nil
 }
 
