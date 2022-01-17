@@ -194,6 +194,8 @@ func (p *Plugin) Init() error {
 				}
 			}
 		}
+		//p.Log.Infoln("waitting for ParseTopologyInfo event")
+		time.Sleep(time.Second)
 	}
 
 	go p.watch_pods_creation(context.Background())
