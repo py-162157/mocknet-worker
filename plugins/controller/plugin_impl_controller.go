@@ -2,7 +2,9 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"io/ioutil"
+	"math"
 	"os"
 	"path"
 	"strconv"
@@ -31,6 +33,7 @@ type Plugin struct {
 	PluginName       string
 	K8sNamespace     string
 	MasterEtcdClient *clientv3.Client
+	CloseSignal      bool
 }
 
 type Deps struct {
@@ -43,25 +46,26 @@ type Deps struct {
 	DirAssign       []string // really needed?
 	DirPrefix       string
 	ReadyCount      int
-	// key: interface name (memifx/x)
-	// value: interface id in host-side vpp
-	InterfaceNameID map[string]uint32
-	// key: interface id in host-side vpp
-	// value: interface name (memifx/x)
-	InterfaceIDName map[uint32]string
+	InterfaceNameID map[string]uint32 // key: interface name (memifx/x), value: interface id in host-side vpp
+	InterfaceIDName map[uint32]string // key: interface id in host-side vpp, value: interface name (memifx/x)
 	Addresses       DepAdress
-	// key: interface name (podname-interfaceid)
-	// value: interface id in host-side vpp
-	IntToVppId    IntToVppIdSync
-	LocalHostName string
-	// only the routine that got the pod's lock can config it
-	PodConfig map[string]*sync.RWMutex
-	LocalPods []string
+	IntToVppId      IntToVppIdSync // key: interface name (podname-interfaceid), value: interface id in host-side vpp
+	LocalHostName   string
+	PodConfig       map[string]*sync.RWMutex // only the routine that got the pod's lock can config it
+	LocalPods       []string
+	PodType         map[string]string // for fat-tree bin test, mark host as sender or receiver
+	PodPair         map[string]string // pod pair for test (sender-receiver)
+	TopologyType    string            // fat-tree or other
+	PodIntToVppId   PodIntToVppIdSync // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
 
 	Log logging.PluginLogger
 }
 
 type IntToVppIdSync struct {
+	Lock *sync.Mutex
+	List map[string]uint32
+}
+type PodIntToVppIdSync struct {
 	Lock *sync.Mutex
 	List map[string]uint32
 }
@@ -145,6 +149,10 @@ func (p *Plugin) Init() error {
 		Lock: &sync.Mutex{},
 		List: make(map[string]Nodeinfo),
 	}
+	p.PodIntToVppId = PodIntToVppIdSync{
+		Lock: &sync.Mutex{},
+		List: make(map[string]uint32),
+	}
 	p.DirAssign = make([]string, 0)
 	p.ReadyCount = 0
 	p.InterfaceIDName = make(map[uint32]string)
@@ -155,6 +163,9 @@ func (p *Plugin) Init() error {
 	}
 	p.PodConfig = make(map[string]*sync.RWMutex)
 	p.LocalPods = make([]string, 0)
+	p.PodType = make(map[string]string)
+	p.PodPair = make(map[string]string)
+	p.TopologyType = "other"
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -182,6 +193,12 @@ func (p *Plugin) Init() error {
 	//p.generate_etcd_config()
 
 	go p.watch_topology(context.Background())
+	go p.watch_PodType(context.Background())
+	go p.watch_PodPair(context.Background())
+	go p.watch_receiver_ready(context.Background())
+	go p.watch_test_command(context.Background())
+	go p.watch_close_signal(context.Background())
+	go p.watch_topo_type(context.Background())
 
 	for {
 		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/ParseTopologyInfo/"+p.LocalHostName)
@@ -207,6 +224,189 @@ func (p *Plugin) String() string {
 
 func (p *Plugin) Close() error {
 	p.clear_directory()
+	return nil
+}
+
+func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
+	fat_tree_routes := make(map[string][]vpp.Route_Info)
+
+	host_numbers := 0
+	for podname, _ := range p.PodSet {
+		if strings.Contains(podname, "h") {
+			host_numbers++
+		}
+	}
+
+	k := int(math.Pow(float64(4*host_numbers), -3))
+	switch_numbers := k*k/4 + k
+	p.Log.Infoln("k =", k)
+
+	cores := make([]string, k)
+	aggregations := make([]string, k*k/2)
+	accesses := make([]string, k*k/2)
+	hosts := make([]string, k*k*k/4)
+
+	for podname, _ := range p.PodSet {
+		if !strings.Contains(podname, "h") {
+			// switchs
+			s, err := strconv.Atoi(strings.Split(podname, "s")[1])
+			if err != nil {
+				panic(err)
+			}
+			if s <= switch_numbers/2 {
+				// left half
+				if s <= k/2 {
+					// core
+					cores[s-1] = podname
+				} else if s%2 != (k/2)%2 {
+					// aggregation
+					aggregations[(4*s-k)/(2*k)-1] = podname
+				} else {
+					// access
+					accesses[(2*s-k)/k-1] = podname
+				}
+			} else {
+				// right half
+				s -= switch_numbers / 2
+
+				if s <= k/2 {
+					// core
+					cores[s+k/2-1] = podname
+				} else if s%2 != (k/2)%2 {
+					// aggregation
+					aggregations[(4*s-k)/(2*k)+k*k/4-1] = podname
+				} else {
+					// access
+					accesses[(2*s-k)/k+k*k/4-1] = podname
+				}
+			}
+
+		} else {
+			// hosts
+			s, err := strconv.Atoi(strings.Split(podname, "s")[1])
+			if err != nil {
+				panic(err)
+			}
+			h, err := strconv.Atoi(strings.Split(strings.Split(podname, "s")[0], "h")[1])
+			if err != nil {
+				panic(err)
+			}
+			if s <= switch_numbers/2 {
+				hosts[s-k+h-1] = podname
+			} else {
+				hosts[s-k+k*k*k/8+h-1] = podname
+			}
+		}
+	}
+
+	p.PodInfos.Lock.Lock()
+	p.PodIntToVppId.Lock.Lock()
+
+	// core switch routes
+	for _, core_name := range cores {
+		fat_tree_routes[core_name] = make([]vpp.Route_Info, 0)
+		for host_index, host_name := range hosts {
+			port := host_index / k
+			fat_tree_routes[core_name] = append(fat_tree_routes[core_name], vpp.Route_Info{
+				Dst: vpp.IpNet{
+					Ip:   p.PodInfos.List[host_name].podip,
+					Mask: 16,
+				},
+				Dev:   "memif0/" + strconv.Itoa(port),
+				DevId: p.PodIntToVppId.List[core_name+"-"+strconv.Itoa(port)],
+			})
+		}
+	}
+
+	// aggregation switch routes
+	for aggregation_index, aggregation_name := range aggregations {
+		fat_tree_routes[aggregation_name] = make([]vpp.Route_Info, 0)
+		for host_index, host_name := range hosts {
+			if host_index/(k*k/4) == aggregation_index/(k/2) {
+				// if aggregation switch and host are in same pod, down forward the package
+				// find out which access switch to forward
+				pod_inner_host_id := host_index % (k * k / 4)
+				port := pod_inner_host_id / (k / 2)
+				fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
+					Dst: vpp.IpNet{
+						Ip:   p.PodInfos.List[host_name].podip,
+						Mask: 16,
+					},
+					Dev:   "memif0/" + strconv.Itoa(port),
+					DevId: p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+				})
+			} else {
+				// else, up forward teh package
+				// find out which core switch to forward
+				port := host_index/(k*k/2) + k/2
+				fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
+					Dst: vpp.IpNet{
+						Ip:   p.PodInfos.List[host_name].podip,
+						Mask: 16,
+					},
+					Dev:   "memif0/" + strconv.Itoa(port),
+					DevId: p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+				})
+			}
+		}
+	}
+
+	// access switch routes
+	for access_index, access_name := range accesses {
+		fat_tree_routes[access_name] = make([]vpp.Route_Info, 0)
+		for host_index, host_name := range hosts {
+			if host_index/(k/2) == access_index {
+				// it access switch and host are linkd, down forward the package
+				// find out which port to forward
+				access_inner_host_id := host_index % (k / 2)
+				port := access_inner_host_id / (k / 2)
+				fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
+					Dst: vpp.IpNet{
+						Ip:   p.PodInfos.List[host_name].podip,
+						Mask: 16,
+					},
+					Dev:   "memif0/" + strconv.Itoa(port),
+					DevId: p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+				})
+			} else {
+				// else, up forward teh package
+				// find out which aggregation switch to forward
+				port := host_index/(k*k/2) + k/2
+				fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
+					Dst: vpp.IpNet{
+						Ip:   p.PodInfos.List[host_name].podip,
+						Mask: 16,
+					},
+					Dev:   "memif0/" + strconv.Itoa(port),
+					DevId: p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+				})
+			}
+		}
+	}
+
+	p.PodInfos.Lock.Unlock()
+	p.PodIntToVppId.Lock.Unlock()
+
+	return fat_tree_routes
+}
+
+func (p *Plugin) watch_close_signal(ctx context.Context) error {
+	for {
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/Close")
+		if err != nil {
+			p.Log.Errorln("failed to probe Close signal")
+		} else {
+			if len(resp.Kvs) != 0 {
+				if string(resp.Kvs[0].Value) == "true" {
+					p.Log.Infoln("received a close signal")
+					p.Linux.RestartVpp()
+					p.CloseSignal = true
+					p.inform_finished("Close")
+					break
+				}
+			}
+		}
+	}
 	return nil
 }
 
@@ -257,6 +457,169 @@ func (p *Plugin) create_directory() {
 	}
 }
 
+func (p *Plugin) watch_PodType(ctx context.Context) error {
+	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/podtype/", clientv3.WithPrefix())
+
+	receive_count := 0
+	for {
+		select {
+		case <-time.After(TIMEOUT):
+			if receive_count > 0 {
+				p.inform_finished("PodTypeReceiveFinished")
+				receive_count = 0
+			}
+		case <-ctx.Done():
+			return nil
+		case resp := <-watchChan:
+			receive_count += 1
+			err := resp.Err()
+			if err != nil {
+				return err
+			}
+			for _, ev := range resp.Events {
+				if ev.IsCreate() {
+					p.parse_podtype(*ev)
+				}
+			}
+		}
+	}
+}
+
+func (p *Plugin) parse_podtype(event clientv3.Event) {
+	// event.Kv.Value: key----/mocknet/podtype/h1s1, value----sender
+	parse_result := strings.Split(string(event.Kv.Value), ",")
+	name_string := parse_result[0]
+	kind_string := parse_result[1]
+	name := strings.Split(name_string, ":")[1]
+	kind := strings.Split(kind_string, ":")[1]
+	p.PodType[name] = kind
+}
+
+func (p *Plugin) watch_PodPair(ctx context.Context) error {
+	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/podpair/", clientv3.WithPrefix())
+
+	receive_count := 0
+	for {
+		select {
+		case <-time.After(TIMEOUT):
+			if receive_count > 0 {
+				p.inform_finished("PodPairReceiveFinished")
+				receive_count = 0
+			}
+
+		case <-ctx.Done():
+			return nil
+		case resp := <-watchChan:
+			receive_count += 1
+			err := resp.Err()
+			if err != nil {
+				return err
+			}
+			for _, ev := range resp.Events {
+				if ev.IsCreate() {
+					p.parse_podpair(*ev)
+				}
+			}
+		}
+	}
+}
+
+func (p *Plugin) parse_podpair(event clientv3.Event) {
+	// event.Kv.Value: key----/mocknet/podpair/h1s1-h2s1, value----h1s1-h2s1
+	parse_result := strings.Split(string(event.Kv.Value), "-")
+	pod1 := parse_result[0]
+	pod2 := parse_result[1]
+	p.PodPair[pod1] = pod2
+}
+
+func (p *Plugin) watch_topo_type(ctx context.Context) error {
+	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/topo/type")
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case resp := <-watchChan:
+			err := resp.Err()
+			if err != nil {
+				return err
+			}
+			for _, ev := range resp.Events {
+				if ev.IsCreate() {
+					if string(ev.Kv.Value) == "fat-tree" {
+						p.TopologyType = "fat-tree"
+						p.inform_finished("TopologyType")
+						return nil
+					}
+				}
+			}
+		}
+	}
+}
+
+func (p *Plugin) watch_receiver_ready(ctx context.Context) error {
+	for {
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "mocknet/command/GetReceiverReady")
+		if err != nil {
+			p.Log.Errorln("failed to probe GetReceiverReady command")
+		} else {
+			if len(resp.Kvs) != 0 {
+				if string(resp.Kvs[0].Value) == "true" {
+					p.get_receiver_ready()
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) get_receiver_ready() {
+	flag := true
+	for _, podname := range p.LocalPods {
+		if p.PodType[podname] == "receiver" {
+			containerid := p.PodInfos.List[podname].containerid
+			result := p.Linux.Set_Receiver(containerid, podname)
+			if result != linux.Success {
+				// cann't set iperf3 server for all local receiver
+				flag = false
+			}
+		}
+	}
+	if flag {
+		p.inform_finished("ReceiverReady")
+	}
+}
+
+func (p *Plugin) watch_test_command(ctx context.Context) error {
+	for {
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "mocknet/command/FullTest")
+		if err != nil {
+			p.Log.Errorln("failed to probe FullTest command")
+		} else {
+			if len(resp.Kvs) != 0 {
+				if string(resp.Kvs[0].Value) == "true" {
+					p.fulltest()
+					break
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (p *Plugin) fulltest() {
+	//flag := true
+	for _, podname := range p.LocalPods {
+		if p.PodType[podname] == "sender" {
+			containerid := p.PodInfos.List[podname].containerid
+			paird_pod := p.PodPair[podname]
+			p.PodInfos.Lock.Lock()
+			dst_ip := p.PodInfos.List[paird_pod].podip
+			p.Linux.Set_Sender(containerid, podname, dst_ip)
+		}
+	}
+}
+
 func (p *Plugin) parse_assignment(event clientv3.Event) {
 	parse_result := strings.Split(string(event.Kv.Value), ",")
 	if strings.Split(parse_result[1], ":")[1] == p.LocalHostName {
@@ -285,6 +648,8 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 				//p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
 				//p.Log.Infoln("p.MocknetTopology.links =", p.MocknetTopology.links)
 				p.inform_finished("ParseTopologyInfo")
+				routes := p.generate_fattree_routes()
+				fmt.Print(routes)
 				receive_count = 0
 			}
 		case <-ctx.Done():
@@ -504,6 +869,9 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		// int_id is the id in a socket used to identify peer(slave or master)
 		vppresult, pod_memif_id = p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
 		if vppresult == vpp.Success {
+			p.PodIntToVppId.Lock.Lock()
+			p.PodIntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = pod_memif_id
+			p.PodIntToVppId.Lock.Unlock()
 			p.Vpp.Pod_Set_interface_state_up(pod.name, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")

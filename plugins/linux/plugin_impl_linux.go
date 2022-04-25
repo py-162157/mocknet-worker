@@ -186,7 +186,7 @@ func (p *Plugin) get_host_main_net_dev() {
 	}
 }
 
-func (p *Plugin) Pod_Add_Route(container_id string, pod_name string) ProcessResult {
+func (p *Plugin) Pod_Add_Route(container_id string, pod_name string, route ...Route_Info) ProcessResult {
 	var stderr bytes.Buffer
 	cmd := exec.Command("docker", "exec", container_id, "ip", "route", "add", "10.1.0.0/16", "dev", "tap0")
 	cmd.Stderr = &stderr
@@ -237,5 +237,45 @@ func (p *Plugin) Pod_Set_Ip(container_id string, pod_name string, ip string) Pro
 		}
 		count += 1
 		time.Sleep(RETRY_TIME_INTERVAL)
+	}
+}
+
+func (p *Plugin) Set_Receiver(container_id string, pod_name string) ProcessResult {
+	var stderr bytes.Buffer
+	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-s")
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		p.Log.Infoln("set iperf3 server for pod", pod_name)
+		return Success
+	} else {
+		p.Log.Errorln("failed to set iperf3 server for pod", pod_name, "err:", stderr.String())
+		return Failed
+	}
+}
+
+func (p *Plugin) Set_Sender(container_id string, pod_name string, dst_ip string) ProcessResult {
+	var stderr bytes.Buffer
+	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "100")
+	cmd.Stderr = &stderr
+	err := cmd.Run()
+	if err == nil {
+		p.Log.Infoln("start iperf3 client for pod", pod_name)
+		return Success
+	} else {
+		p.Log.Errorln("failed to start iperf3 client for pod", pod_name, "err:", stderr.String())
+		return Failed
+	}
+}
+
+func (p *Plugin) RestartVpp() ProcessResult {
+	restart_cmd := exec.Command("service", "vpp", "restart")
+	err := restart_cmd.Run()
+	if err != nil {
+		p.Log.Errorln(err)
+		return Failed
+	} else {
+		p.Log.Infoln("service vpp restarted")
+		return Success
 	}
 }

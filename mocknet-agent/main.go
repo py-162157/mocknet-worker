@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultStartupTimeout = 45 * time.Second
+	defaultStartupTimeout = 180 * time.Second
 )
 
 type MocknetAgent struct {
@@ -61,10 +61,18 @@ func main() {
 	}
 
 	a := agent.NewAgent(agent.AllPlugins(mocknetAgent), agent.StartTimeout(getStartupTimeout()))
-	if err := a.Run(); err != nil {
+	if err := a.Start(); err != nil {
 		logrus.DefaultLogger().Fatal(err)
 	}
 
+	for {
+		time.Sleep(time.Second)
+		//logrus.DefaultLogger().Infoln("ControllerPlugin.CloseSignal =", ControllerPlugin.CloseSignal)
+		if ControllerPlugin.CloseSignal {
+			a.Stop()
+			break
+		}
+	}
 }
 
 func getStartupTimeout() time.Duration {
