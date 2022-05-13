@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"mocknet/plugins/controller"
+	"mocknet/plugins/etcd"
 	"mocknet/plugins/linux"
 	"mocknet/plugins/vpp"
 
@@ -23,6 +24,7 @@ type MocknetAgent struct {
 
 	VPP        *vpp.Plugin
 	Controller *controller.Plugin
+	ETCD       *etcd.Plugin
 }
 
 func (ma *MocknetAgent) String() string {
@@ -41,6 +43,9 @@ func main() {
 
 	LogmanagerPlugin := &logmanager.DefaultPlugin
 
+	ETCDPlugin := etcd.NewPlugin(etcd.UseDeps(func(deps *etcd.Deps) {
+	}))
+
 	VppPlugin := vpp.NewPlugin(vpp.UseDeps(func(deps *vpp.Deps) {
 	}))
 
@@ -51,6 +56,7 @@ func main() {
 	ControllerPlugin := controller.NewPlugin(controller.UseDeps(func(deps *controller.Deps) {
 		deps.Vpp = VppPlugin
 		deps.Linux = LinuxPlugin
+		deps.ETCD = ETCDPlugin
 	}))
 
 	mocknetAgent := &MocknetAgent{
@@ -58,6 +64,7 @@ func main() {
 		LogManager: LogmanagerPlugin,
 		VPP:        VppPlugin,
 		Controller: ControllerPlugin,
+		ETCD:       ETCDPlugin,
 	}
 
 	a := agent.NewAgent(agent.AllPlugins(mocknetAgent), agent.StartTimeout(getStartupTimeout()))

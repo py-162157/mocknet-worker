@@ -16,15 +16,15 @@ import (
 
 	"git.fd.io/govpp.git/core"
 
-	fib_types_2106 "mocknet/binapi/vpp2106/fib_types"
-	interfaces_2106 "mocknet/binapi/vpp2106/interface"
-	interface_types_2106 "mocknet/binapi/vpp2106/interface_types"
-	ip_2106 "mocknet/binapi/vpp2106/ip"
-	ip_types_2106 "mocknet/binapi/vpp2106/ip_types"
-	l2_2106 "mocknet/binapi/vpp2106/l2"
-	memif_2106 "mocknet/binapi/vpp2106/memif"
-	tap_2106 "mocknet/binapi/vpp2106/tapv2"
-	vxlan_2106 "mocknet/binapi/vpp2106/vxlan"
+	fib_types_2110 "mocknet/binapi/vpp2110/fib_types"
+	interfaces_2110 "mocknet/binapi/vpp2110/interface"
+	interface_types_2110 "mocknet/binapi/vpp2110/interface_types"
+	ip_2110 "mocknet/binapi/vpp2110/ip"
+	ip_types_2110 "mocknet/binapi/vpp2110/ip_types"
+	l2_2110 "mocknet/binapi/vpp2110/l2"
+	memif_2110 "mocknet/binapi/vpp2110/memif"
+	tap_2110 "mocknet/binapi/vpp2110/tapv2"
+	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
 
 	fib_types_2009 "mocknet/binapi/vpp2009/fib_types"
 	interfaces_2009 "mocknet/binapi/vpp2009/interface"
@@ -40,6 +40,7 @@ const (
 	SOCKET_NAME         = "memif.sock"
 	RETRY_TIME_INTERVAL = 1 * time.Second
 	MAX_RETRY_TIMES     = 3
+	KEEP_CONNECTION     = true
 )
 
 var (
@@ -76,6 +77,7 @@ type Plugin struct {
 	PluginName   string
 	K8sNamespace string
 	EtcdClient   *clientv3.Client
+	conn         *core.Connection
 }
 
 type Deps struct {
@@ -88,6 +90,9 @@ func (p *Plugin) Init() error {
 	}
 
 	p.PluginName = "vpp"
+	if KEEP_CONNECTION {
+		p.conn = p.connect_to_main_vpp()
+	}
 
 	return nil
 }
@@ -110,16 +115,21 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) ProcessResult {
 	}
 	//p.Log.Infoln("createing socket:", id, filename)
 
-	req := &memif_2106.MemifSocketFilenameAddDel{
+	req := &memif_2110.MemifSocketFilenameAddDel{
 		IsAdd:          true,
 		SocketID:       id,
 		SocketFilename: filename,
 	}
-	reply := &memif_2106.MemifSocketFilenameAddDelReply{}
+	reply := &memif_2110.MemifSocketFilenameAddDelReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -128,7 +138,9 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) ProcessResult {
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Warningln("failed to create memif socket, retrying", err)
 			if count >= MAX_RETRY_TIMES {
@@ -136,7 +148,9 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) ProcessResult {
 				return TimesOver
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("created socket:", id, filename)
 			return Success
@@ -147,13 +161,18 @@ func (p *Plugin) CreateSocket(id uint32, filedir string) ProcessResult {
 }
 
 func (p *Plugin) DeleteSocket(id uint32) {
-	req := &memif_2106.MemifSocketFilenameAddDel{
+	req := &memif_2110.MemifSocketFilenameAddDel{
 		IsAdd:    false,
 		SocketID: id,
 	}
-	reply := &memif_2106.MemifSocketFilenameAddDelReply{}
+	reply := &memif_2110.MemifSocketFilenameAddDelReply{}
 
-	conn := p.connect_to_main_vpp()
+	var conn *core.Connection
+	if !KEEP_CONNECTION {
+		conn = p.connect_to_main_vpp()
+	} else {
+		conn = p.conn
+	}
 	ch, err := conn.NewAPIChannel()
 
 	if err != nil {
@@ -165,30 +184,37 @@ func (p *Plugin) DeleteSocket(id uint32) {
 		p.Log.Errorln("failed to delete memif socket, id =", id)
 		panic(err)
 	}
-	conn.Disconnect()
+	if !KEEP_CONNECTION {
+		conn.Disconnect()
+	}
 	ch.Close()
 
 	p.Log.Infoln("deleted socket:", id)
 }
 
 func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id uint32) (ProcessResult, uint32) {
-	var role memif_2106.MemifRole
+	var role memif_2110.MemifRole
 	if role_string == "master" {
-		role = memif_2106.MEMIF_ROLE_API_MASTER
+		role = memif_2110.MEMIF_ROLE_API_MASTER
 	} else {
-		role = memif_2106.MEMIF_ROLE_API_SLAVE
+		role = memif_2110.MEMIF_ROLE_API_SLAVE
 	}
 
-	req := &memif_2106.MemifCreate{
+	req := &memif_2110.MemifCreate{
 		Role:     role,
 		ID:       id,
 		SocketID: socket_id,
 	}
-	reply := &memif_2106.MemifCreateReply{}
+	reply := &memif_2110.MemifCreateReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -197,7 +223,9 @@ func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			if strings.Contains(err.Error(), "already exists") {
 				p.Log.Warningln("the memif interface already exist, id:", id, "socket-id:", socket_id, "role:", role_string)
@@ -211,7 +239,9 @@ func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id
 				}
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("created interface id:", id, "socket-id:", socket_id, "role:", role_string, "SwIfIndex", reply.SwIfIndex)
 			return Success, uint32(reply.SwIfIndex)
@@ -222,12 +252,17 @@ func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id
 }
 
 func (p *Plugin) Delete_Memif_Interface(id uint32) ProcessResult {
-	req := &memif_2106.MemifDelete{
-		SwIfIndex: interface_types_2106.InterfaceIndex(id),
+	req := &memif_2110.MemifDelete{
+		SwIfIndex: interface_types_2110.InterfaceIndex(id),
 	}
-	reply := &memif_2106.MemifDeleteReply{}
+	reply := &memif_2110.MemifDeleteReply{}
 
-	conn := p.connect_to_main_vpp()
+	var conn *core.Connection
+	if !KEEP_CONNECTION {
+		conn = p.connect_to_main_vpp()
+	} else {
+		conn = p.conn
+	}
 	ch, err := conn.NewAPIChannel()
 
 	if err != nil {
@@ -236,7 +271,9 @@ func (p *Plugin) Delete_Memif_Interface(id uint32) ProcessResult {
 	}
 
 	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		conn.Disconnect()
+		if !KEEP_CONNECTION {
+			conn.Disconnect()
+		}
 		ch.Close()
 		if strings.Contains(err.Error(), "Invalid") {
 			p.Log.Warningln("the memif interface to be deleted not exist")
@@ -246,7 +283,9 @@ func (p *Plugin) Delete_Memif_Interface(id uint32) ProcessResult {
 			return TimesOver
 		}
 	} else {
-		conn.Disconnect()
+		if !KEEP_CONNECTION {
+			conn.Disconnect()
+		}
 		ch.Close()
 		p.Log.Infoln("deleted memif interface, id =", id)
 		return Success
@@ -300,15 +339,20 @@ func (p *Plugin) Pod_Create_Memif_Interface(pod_name string, role_string string,
 }
 
 func (p *Plugin) Set_interface_state_up(id uint32) ProcessResult {
-	req := &interfaces_2106.SwInterfaceSetFlags{
-		SwIfIndex: interface_types_2106.InterfaceIndex(id),
+	req := &interfaces_2110.SwInterfaceSetFlags{
+		SwIfIndex: interface_types_2110.InterfaceIndex(id),
 		Flags:     1,
 	}
-	reply := &interfaces_2106.SwInterfaceSetFlagsReply{}
+	reply := &interfaces_2110.SwInterfaceSetFlagsReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -317,7 +361,9 @@ func (p *Plugin) Set_interface_state_up(id uint32) ProcessResult {
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Warningln("failed to set interface state up, retrying", err)
 			if count >= MAX_RETRY_TIMES {
@@ -325,7 +371,9 @@ func (p *Plugin) Set_interface_state_up(id uint32) ProcessResult {
 				return TimesOver
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("set interface id", id, "state up")
 			return Success
@@ -396,21 +444,21 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 		dst_addr_slice[i] = uint8(conv)
 	}
 
-	req := &vxlan_2106.VxlanAddDelTunnel{
+	req := &vxlan_2110.VxlanAddDelTunnel{
 		IsAdd:    true,
 		Instance: instance,
-		SrcAddress: ip_types_2106.Address{
+		SrcAddress: ip_types_2110.Address{
 			Af: 0,
-			Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
 				src_addr_slice[0],
 				src_addr_slice[1],
 				src_addr_slice[2],
 				src_addr_slice[3],
 			}),
 		},
-		DstAddress: ip_types_2106.Address{
+		DstAddress: ip_types_2110.Address{
 			Af: 0,
-			Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address{
+			Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address{
 				dst_addr_slice[0],
 				dst_addr_slice[1],
 				dst_addr_slice[2],
@@ -421,11 +469,16 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 		EncapVrfID:     0,
 		DecapNextIndex: 1,
 	}
-	reply := &vxlan_2106.VxlanAddDelTunnelReply{}
+	reply := &vxlan_2110.VxlanAddDelTunnelReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -434,7 +487,9 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			if strings.Contains(err.Error(), "already exist") {
 				p.Log.Info("vxlan tunnel already exist:", "src:", src, "dst:", dst, "vni:", vni)
@@ -447,7 +502,9 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 				}
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("created vxlan tunnel:", "src:", src, "dst:", dst, "vni:", vni)
 			return Success, uint32(reply.SwIfIndex)
@@ -458,13 +515,18 @@ func (p *Plugin) Create_Vxlan_Tunnel(src string, dst string, vni uint32, instanc
 }
 
 func (p *Plugin) Delete_Vxlan_Tunnel(id uint32) ProcessResult {
-	req := &vxlan_2106.VxlanAddDelTunnel{
+	req := &vxlan_2110.VxlanAddDelTunnel{
 		IsAdd:          false,
-		McastSwIfIndex: interface_types_2106.InterfaceIndex(id),
+		McastSwIfIndex: interface_types_2110.InterfaceIndex(id),
 	}
-	reply := &vxlan_2106.VxlanAddDelTunnelReply{}
+	reply := &vxlan_2110.VxlanAddDelTunnelReply{}
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -474,11 +536,15 @@ func (p *Plugin) Delete_Vxlan_Tunnel(id uint32) ProcessResult {
 
 		// todo: unconfig of timesover
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Warningln("failed to delete vxlan tunnel, retry, err:", err)
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("deleted vxlan tunnel:", "id:", id)
 			return Success
@@ -488,16 +554,21 @@ func (p *Plugin) Delete_Vxlan_Tunnel(id uint32) ProcessResult {
 }
 
 func (p *Plugin) XConnect(tx_id uint32, rx_id uint32) ProcessResult {
-	req := &l2_2106.SwInterfaceSetL2Xconnect{
-		RxSwIfIndex: interface_types_2106.InterfaceIndex(rx_id),
-		TxSwIfIndex: interface_types_2106.InterfaceIndex(tx_id),
+	req := &l2_2110.SwInterfaceSetL2Xconnect{
+		RxSwIfIndex: interface_types_2110.InterfaceIndex(rx_id),
+		TxSwIfIndex: interface_types_2110.InterfaceIndex(tx_id),
 		Enable:      true,
 	}
-	reply := &l2_2106.SwInterfaceSetL2XconnectReply{}
+	reply := &l2_2110.SwInterfaceSetL2XconnectReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -506,7 +577,9 @@ func (p *Plugin) XConnect(tx_id uint32, rx_id uint32) ProcessResult {
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Warningln("failed to xconnect interfaces", "tx_id:", tx_id, "rx_id:", rx_id)
 			p.Log.Warningln(err)
@@ -515,7 +588,9 @@ func (p *Plugin) XConnect(tx_id uint32, rx_id uint32) ProcessResult {
 				return TimesOver
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("xconnect:", "tx_id:", tx_id, "rx_id:", rx_id)
 			return Success
@@ -631,24 +706,29 @@ func (p *Plugin) Pod_Bridge(pod_name string, ints_id []uint32, bridge_id uint32)
 }
 
 func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
-	req := &interfaces_2106.SwInterfaceAddDelAddress{
-		SwIfIndex: interface_types_2106.InterfaceIndex(int_id),
+	req := &interfaces_2110.SwInterfaceAddDelAddress{
+		SwIfIndex: interface_types_2110.InterfaceIndex(int_id),
 		IsAdd:     true,
-		Prefix: ip_types_2106.AddressWithPrefix(
-			ip_types_2106.Prefix{
-				Address: ip_types_2106.Address{
+		Prefix: ip_types_2110.AddressWithPrefix(
+			ip_types_2110.Prefix{
+				Address: ip_types_2110.Address{
 					Af: 0,
-					Un: ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(ip.parse_ipv4_address())),
+					Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(ip.parse_ipv4_address())),
 				},
 				Len: uint8(ip.Mask),
 			},
 		),
 	}
-	reply := &interfaces_2106.SwInterfaceAddDelAddressReply{}
+	reply := &interfaces_2110.SwInterfaceAddDelAddressReply{}
 
 	count := 0
 	for {
-		conn := p.connect_to_main_vpp()
+		var conn *core.Connection
+		if !KEEP_CONNECTION {
+			conn = p.connect_to_main_vpp()
+		} else {
+			conn = p.conn
+		}
 		ch, err := conn.NewAPIChannel()
 
 		if err != nil {
@@ -657,7 +737,9 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
 		}
 
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Warningln("failed to set interface address, retrying", err)
 			if count >= MAX_RETRY_TIMES {
@@ -665,7 +747,9 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
 				return TimesOver
 			}
 		} else {
-			conn.Disconnect()
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
 			ch.Close()
 			p.Log.Infoln("set interface address")
 			return Success
@@ -676,12 +760,17 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
 }
 
 func (p *Plugin) Create_Tap() ProcessResult {
-	req := &tap_2106.TapCreateV2{
+	req := &tap_2110.TapCreateV2{
 		ID: 0,
 	}
-	reply := &tap_2106.TapCreateV2Reply{}
+	reply := &tap_2110.TapCreateV2Reply{}
 
-	conn := p.connect_to_main_vpp()
+	var conn *core.Connection
+	if !KEEP_CONNECTION {
+		conn = p.connect_to_main_vpp()
+	} else {
+		conn = p.conn
+	}
 	ch, err := conn.NewAPIChannel()
 
 	if err != nil {
@@ -694,7 +783,9 @@ func (p *Plugin) Create_Tap() ProcessResult {
 		return TimesOver
 	}
 
-	conn.Disconnect()
+	if !KEEP_CONNECTION {
+		conn.Disconnect()
+	}
 	ch.Close()
 	p.Log.Infoln("created host tap interface")
 	return Success
@@ -721,7 +812,7 @@ func (p *Plugin) Pod_Create_Tap(pod_name string) (ProcessResult, uint32) {
 			conn.Disconnect()
 			ch.Close()
 			if strings.Contains(err.Error(), "already exist") {
-				p.Log.Info("tap interface already exist")
+				p.Log.Warningln("tap interface already exist")
 				return ProcessResult("AlreadyExist"), 0
 			} else {
 				p.Log.Warningln("failed to create pod tap interface, retrying", err)
@@ -747,7 +838,8 @@ type Route_Info struct {
 	// Dev and DevId are always synchronously be set or empty
 	Dev string
 	// Dev and DevId are always synchronously be set or empty
-	DevId uint32
+	DevId   uint32
+	DstName string
 }
 
 type IpNet struct {
@@ -774,26 +866,26 @@ func (ip IpNet) parse_ipv4_address() [4]uint8 {
 }
 
 func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
-	req := &ip_2106.IPRouteAddDel{
+	req := &ip_2110.IPRouteAddDel{
 		// Multi path is always true
 		IsMultipath: true,
 		IsAdd:       true,
 	}
 
-	fibPath := fib_types_2106.FibPath{}
+	fibPath := fib_types_2110.FibPath{}
 
 	if route.Gw.Ip != "" {
-		fibPath.Nh = fib_types_2106.FibPathNh{
-			Address:            ip_types_2106.AddressUnionIP4(ip_types_2106.IP4Address(route.Gw.parse_ipv4_address())),
+		fibPath.Nh = fib_types_2110.FibPathNh{
+			Address:            ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(route.Gw.parse_ipv4_address())),
 			ClassifyTableIndex: ClassifyTableIndexUnset,
 		}
-		fibPath.Proto = fib_types_2106.FIB_API_PATH_NH_PROTO_IP4
+		fibPath.Proto = fib_types_2110.FIB_API_PATH_NH_PROTO_IP4
 	}
 
-	prefix := ip_types_2106.Prefix{
-		Address: ip_types_2106.Address{
-			Af: ip_types_2106.ADDRESS_IP4,
-			Un: ip_types_2106.AddressUnionIP4(route.Dst.parse_ipv4_address()),
+	prefix := ip_types_2110.Prefix{
+		Address: ip_types_2110.Address{
+			Af: ip_types_2110.ADDRESS_IP4,
+			Un: ip_types_2110.AddressUnionIP4(route.Dst.parse_ipv4_address()),
 		},
 		Len: uint8(route.Dst.Mask),
 	}
@@ -802,15 +894,20 @@ func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 		fibPath.SwIfIndex = route.DevId
 	}
 
-	req.Route = ip_2106.IPRoute{
+	req.Route = ip_2110.IPRoute{
 		Prefix: prefix,
 		NPaths: 1,
-		Paths:  []fib_types_2106.FibPath{fibPath},
+		Paths:  []fib_types_2110.FibPath{fibPath},
 	}
 
-	reply := &ip_2106.IPRouteAddDelReply{}
+	reply := &ip_2110.IPRouteAddDelReply{}
 
-	conn := p.connect_to_main_vpp()
+	var conn *core.Connection
+	if !KEEP_CONNECTION {
+		conn = p.connect_to_main_vpp()
+	} else {
+		conn = p.conn
+	}
 	ch, err := conn.NewAPIChannel()
 
 	if err != nil {
@@ -822,7 +919,9 @@ func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 		p.Log.Errorln("failed to add vpp route, dst:", route.Dst, ", via:", route.Gw, ", dev:", route.Dev)
 		return TimesOver
 	}
-	conn.Disconnect()
+	if !KEEP_CONNECTION {
+		conn.Disconnect()
+	}
 	ch.Close()
 	p.Log.Infoln("added vpp route, dst:", route.Dst, ", via:", route.Gw, ", dev:", route.Dev)
 	return Success
@@ -911,9 +1010,11 @@ func (p *Plugin) connect_to_main_vpp() *core.Connection {
 	for {
 		conn, err = govpp.Connect(*sockAddr)
 		if err != nil {
-			p.Log.Warningln("ERROR:", err)
+			if !strings.Contains(err.Error(), "temporarily") {
+				p.Log.Warningln("Warning:", err)
+			}
 		} else {
-			//p.Log.Infoln("connected to main vpp")
+			p.Log.Infoln("connected to main vpp")
 			break
 		}
 		time.Sleep(time.Second)

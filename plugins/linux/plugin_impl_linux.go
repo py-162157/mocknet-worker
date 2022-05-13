@@ -279,3 +279,42 @@ func (p *Plugin) RestartVpp() ProcessResult {
 		return Success
 	}
 }
+
+func (p *Plugin) Get_MAC_Addr(container_id string, pod_name string) string {
+	cmd := exec.Command("docker", "exec", container_id, "ifconfig", "tap0")
+	r, err := cmd.Output()
+	if err != nil {
+		p.Log.Errorln(err)
+	}
+
+	//p.Log.Infoln("for pod ", pod_name, " origin string =", string(r))
+	split_string1 := strings.Split(string(r), "ether")[1]
+	//p.Log.Infoln("string1 =", split_string1)
+	split_string2 := strings.Split(split_string1, "txqueuelen")[0]
+	//p.Log.Infoln("string2 =", split_string2)
+	MAC_Address := strings.ReplaceAll(split_string2, " ", "")
+	return MAC_Address
+}
+
+type ARP struct {
+	Name string
+	Ip   string
+	Mac  string
+}
+
+func (p *Plugin) Set_Static_ARP(container_id string, pod_name string, podinfos map[string]ARP) error {
+	for dst_name, info := range podinfos {
+		if dst_name != pod_name {
+			//p.Log.Infoln("for pod", info.Name, "containerid =", info.ContainerId, "dstip =", info.Ip, "macaddr =", info.Mac)
+			cmd := exec.Command("docker", "exec", container_id, "arp", "-s", info.Ip, info.Mac)
+			err := cmd.Run()
+			if err != nil {
+				p.Log.Errorln(err)
+			}
+		}
+	}
+
+	p.Log.Infoln("Static ARP write for pod", pod_name)
+
+	return nil
+}

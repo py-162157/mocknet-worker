@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io/ioutil"
-	"math"
 	"os"
 	"path"
 	"strconv"
@@ -12,15 +11,21 @@ import (
 	"sync"
 	"time"
 
+	"mocknet/plugins/etcd"
 	"mocknet/plugins/linux"
+
 	"mocknet/plugins/vpp"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.ligato.io/cn-infra/v2/logging"
 )
 
+var global_count = 0
+
+var wgs = make(map[string]*sync.WaitGroup)
+
 const (
-	TIMEOUT              = time.Duration(3) * time.Second // 超时
+	TIMEOUT              = time.Duration(10) * time.Second // 超时
 	ETCD_ADDRESS         = "0.0.0.0:32379"
 	POD_VPP_CONFIG_FILE  = "/etc/vpp/vpp.conf"
 	HOST_VPP_CONFIG_FILE = "/etc/vpp/startup.conf"
@@ -37,8 +42,10 @@ type Plugin struct {
 }
 
 type Deps struct {
-	Vpp             *vpp.Plugin
-	Linux           *linux.Plugin
+	Vpp   *vpp.Plugin
+	Linux *linux.Plugin
+	ETCD  *etcd.Plugin
+
 	MocknetTopology NetTopo
 	PodInfos        PodInfosSync
 	NodeInfos       NodeInfosSync
@@ -46,19 +53,31 @@ type Deps struct {
 	DirAssign       []string // really needed?
 	DirPrefix       string
 	ReadyCount      int
-	InterfaceNameID map[string]uint32 // key: interface name (memifx/x), value: interface id in host-side vpp
-	InterfaceIDName map[uint32]string // key: interface id in host-side vpp, value: interface name (memifx/x)
+	InterfaceNameID InterfaceNameIDSync // key: interface name (memifx/x), value: interface id in host-side vpp
+	InterfaceIDName InterfaceIDNameSync // key: interface id in host-side vpp, value: interface name (memifx/x)
 	Addresses       DepAdress
 	IntToVppId      IntToVppIdSync // key: interface name (podname-interfaceid), value: interface id in host-side vpp
 	LocalHostName   string
-	PodConfig       map[string]*sync.RWMutex // only the routine that got the pod's lock can config it
-	LocalPods       []string
-	PodType         map[string]string // for fat-tree bin test, mark host as sender or receiver
-	PodPair         map[string]string // pod pair for test (sender-receiver)
-	TopologyType    string            // fat-tree or other
-	PodIntToVppId   PodIntToVppIdSync // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
+	//PodConfig       map[string]*sync.RWMutex // only the routine that got the pod's lock can config it
+	LocalPods     []string
+	PodType       map[string]string           // for fat-tree bin test, mark host as sender or receiver
+	PodPair       map[string]string           // pod pair for test (sender-receiver)
+	TopologyType  string                      // fat-tree or other
+	PodIntToVppId PodIntToVppIdSync           // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
+	Routes        map[string][]vpp.Route_Info // route for all pods
+	WaitGroups    map[string]sync.WaitGroup
 
 	Log logging.PluginLogger
+}
+
+type InterfaceNameIDSync struct {
+	Lock *sync.Mutex
+	List map[string]uint32
+}
+
+type InterfaceIDNameSync struct {
+	Lock *sync.Mutex
+	List map[uint32]string
 }
 
 type IntToVppIdSync struct {
@@ -72,7 +91,7 @@ type PodIntToVppIdSync struct {
 
 type PodInfosSync struct {
 	Lock *sync.Mutex
-	List map[string]podinfo
+	List map[string]Podinfo
 }
 
 type NodeInfosSync struct {
@@ -93,14 +112,15 @@ type Nodeinfo struct {
 	vtepip string
 }
 
-type podinfo struct {
+type Podinfo struct {
 	name         string
 	namespace    string
-	podip        string
+	Podip        string
 	hostip       string
 	hostname     string
 	restartcount int
 	containerid  string
+	Macaddr      string
 }
 
 type NetTopo struct {
@@ -143,7 +163,7 @@ func (p *Plugin) Init() error {
 	p.PodSet = make(map[string]map[string]string)
 	p.PodInfos = PodInfosSync{
 		Lock: &sync.Mutex{},
-		List: make(map[string]podinfo),
+		List: make(map[string]Podinfo),
 	}
 	p.NodeInfos = NodeInfosSync{
 		Lock: &sync.Mutex{},
@@ -155,17 +175,25 @@ func (p *Plugin) Init() error {
 	}
 	p.DirAssign = make([]string, 0)
 	p.ReadyCount = 0
-	p.InterfaceIDName = make(map[uint32]string)
-	p.InterfaceNameID = make(map[string]uint32)
+	p.InterfaceIDName = InterfaceIDNameSync{
+		Lock: &sync.Mutex{},
+		List: make(map[uint32]string),
+	}
+	p.InterfaceNameID = InterfaceNameIDSync{
+		Lock: &sync.Mutex{},
+		List: make(map[string]uint32),
+	}
 	p.IntToVppId = IntToVppIdSync{
 		Lock: &sync.Mutex{},
 		List: make(map[string]uint32),
 	}
-	p.PodConfig = make(map[string]*sync.RWMutex)
+	//p.PodConfig = make(map[string]*sync.RWMutex)
 	p.LocalPods = make([]string, 0)
 	p.PodType = make(map[string]string)
 	p.PodPair = make(map[string]string)
+	p.Routes = make(map[string][]vpp.Route_Info)
 	p.TopologyType = "other"
+	wgs["main"] = &sync.WaitGroup{}
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -186,19 +214,20 @@ func (p *Plugin) Init() error {
 		panic(err)
 	} else {
 		p.LocalHostName = local_hostname
+		p.ETCD.LocalHostName = local_hostname
 	}
 
 	go p.get_node_infos(p.LocalHostName)
 	go p.watch_assignment(context.Background())
 	//p.generate_etcd_config()
 
+	go p.watch_topo_type(context.Background())
 	go p.watch_topology(context.Background())
 	go p.watch_PodType(context.Background())
 	go p.watch_PodPair(context.Background())
 	go p.watch_receiver_ready(context.Background())
 	go p.watch_test_command(context.Background())
 	go p.watch_close_signal(context.Background())
-	go p.watch_topo_type(context.Background())
 
 	for {
 		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/ParseTopologyInfo/"+p.LocalHostName)
@@ -236,10 +265,13 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 			host_numbers++
 		}
 	}
-
-	k := int(math.Pow(float64(4*host_numbers), -3))
-	switch_numbers := k*k/4 + k
-	p.Log.Infoln("k =", k)
+	k := 4
+	for {
+		if k*k*k/4 == host_numbers {
+			break
+		}
+		k += 2
+	}
 
 	cores := make([]string, k)
 	aggregations := make([]string, k*k/2)
@@ -253,31 +285,16 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 			if err != nil {
 				panic(err)
 			}
-			if s <= switch_numbers/2 {
-				// left half
-				if s <= k/2 {
-					// core
-					cores[s-1] = podname
-				} else if s%2 != (k/2)%2 {
-					// aggregation
-					aggregations[(4*s-k)/(2*k)-1] = podname
-				} else {
-					// access
-					accesses[(2*s-k)/k-1] = podname
-				}
+			if s <= k*k/4 {
+				// core
+				cores[s-1] = podname
 			} else {
-				// right half
-				s -= switch_numbers / 2
-
-				if s <= k/2 {
-					// core
-					cores[s+k/2-1] = podname
-				} else if s%2 != (k/2)%2 {
+				if s%2 != (k*k/4)%2 {
 					// aggregation
-					aggregations[(4*s-k)/(2*k)+k*k/4-1] = podname
+					aggregations[(s-k*k/4)/2] = podname
 				} else {
 					// access
-					accesses[(2*s-k)/k+k*k/4-1] = podname
+					accesses[(s-k*k/4)/2-1] = podname
 				}
 			}
 
@@ -291,102 +308,143 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 			if err != nil {
 				panic(err)
 			}
-			if s <= switch_numbers/2 {
-				hosts[s-k+h-1] = podname
-			} else {
-				hosts[s-k+k*k*k/8+h-1] = podname
-			}
+			fmt.Println("s =", s, "k =", k, "h =", h)
+			hosts[((s-k*k/4)/2-1)*(k/2)+h-1] = podname
 		}
 	}
 
-	p.PodInfos.Lock.Lock()
-	p.PodIntToVppId.Lock.Lock()
+	fmt.Println("core switches =", cores)
+	fmt.Println("aggregation switches =", aggregations)
+	fmt.Println("access switches =", accesses)
+	fmt.Println("hosts =", hosts)
 
 	// core switch routes
 	for _, core_name := range cores {
-		fat_tree_routes[core_name] = make([]vpp.Route_Info, 0)
-		for host_index, host_name := range hosts {
-			port := host_index / k
-			fat_tree_routes[core_name] = append(fat_tree_routes[core_name], vpp.Route_Info{
-				Dst: vpp.IpNet{
-					Ip:   p.PodInfos.List[host_name].podip,
-					Mask: 16,
-				},
-				Dev:   "memif0/" + strconv.Itoa(port),
-				DevId: p.PodIntToVppId.List[core_name+"-"+strconv.Itoa(port)],
-			})
+		if p.Is_Local(core_name) {
+			fat_tree_routes[core_name] = make([]vpp.Route_Info, 0)
+			for host_index, host_name := range hosts {
+				port := host_index / (k * k / 4)
+				_, ok := p.PodIntToVppId.List[core_name+"-"+strconv.Itoa(port)]
+				if !ok {
+					p.Log.Warningln("devid for ", core_name+"-"+strconv.Itoa(port), "not exist")
+				}
+				fat_tree_routes[core_name] = append(fat_tree_routes[core_name], vpp.Route_Info{
+					Dst: vpp.IpNet{
+						Ip:   p.PodInfos.List[host_name].Podip, // now maybe not received, so take replace by DstName domain
+						Mask: 32,
+					},
+					Dev:     "memif0/" + strconv.Itoa(port),
+					DevId:   p.PodIntToVppId.List[core_name+"-"+strconv.Itoa(port)],
+					DstName: host_name, // read DstIp by DstName after received the pod's ip address
+				})
+			}
 		}
 	}
 
 	// aggregation switch routes
 	for aggregation_index, aggregation_name := range aggregations {
-		fat_tree_routes[aggregation_name] = make([]vpp.Route_Info, 0)
-		for host_index, host_name := range hosts {
-			if host_index/(k*k/4) == aggregation_index/(k/2) {
-				// if aggregation switch and host are in same pod, down forward the package
-				// find out which access switch to forward
-				pod_inner_host_id := host_index % (k * k / 4)
-				port := pod_inner_host_id / (k / 2)
-				fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
-					Dst: vpp.IpNet{
-						Ip:   p.PodInfos.List[host_name].podip,
-						Mask: 16,
-					},
-					Dev:   "memif0/" + strconv.Itoa(port),
-					DevId: p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
-				})
-			} else {
-				// else, up forward teh package
-				// find out which core switch to forward
-				port := host_index/(k*k/2) + k/2
-				fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
-					Dst: vpp.IpNet{
-						Ip:   p.PodInfos.List[host_name].podip,
-						Mask: 16,
-					},
-					Dev:   "memif0/" + strconv.Itoa(port),
-					DevId: p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
-				})
+		if p.Is_Local(aggregation_name) {
+			fat_tree_routes[aggregation_name] = make([]vpp.Route_Info, 0)
+			for host_index, host_name := range hosts {
+				if host_index/(k*k/4) == aggregation_index/(k/2) {
+					// if aggregation switch and host are in same pod, down forward the package
+					// find out which access switch to forward
+					pod_inner_host_id := host_index % (k * k / 4)
+					port := pod_inner_host_id / (k / 2)
+					_, ok := p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)]
+					if !ok {
+						p.Log.Warningln("devid for ", aggregation_name+"-"+strconv.Itoa(port), "not exist")
+					}
+					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
+						Dst: vpp.IpNet{
+							Ip:   p.PodInfos.List[host_name].Podip,
+							Mask: 32,
+						},
+						Dev:     "memif0/" + strconv.Itoa(port),
+						DevId:   p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+						DstName: host_name,
+					})
+				} else {
+					// else, up forward the package
+					// find out which core switch to forward
+					port := host_index/(k*k/2) + k/2
+					_, ok := p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)]
+					if !ok {
+						p.Log.Warningln("devid for ", aggregation_name+"-"+strconv.Itoa(port), "not exist")
+					}
+					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
+						Dst: vpp.IpNet{
+							Ip:   p.PodInfos.List[host_name].Podip,
+							Mask: 32,
+						},
+						Dev:     "memif0/" + strconv.Itoa(port),
+						DevId:   p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+						DstName: host_name,
+					})
+				}
 			}
 		}
 	}
 
 	// access switch routes
 	for access_index, access_name := range accesses {
-		fat_tree_routes[access_name] = make([]vpp.Route_Info, 0)
-		for host_index, host_name := range hosts {
-			if host_index/(k/2) == access_index {
-				// it access switch and host are linkd, down forward the package
-				// find out which port to forward
-				access_inner_host_id := host_index % (k / 2)
-				port := access_inner_host_id / (k / 2)
-				fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
-					Dst: vpp.IpNet{
-						Ip:   p.PodInfos.List[host_name].podip,
-						Mask: 16,
-					},
-					Dev:   "memif0/" + strconv.Itoa(port),
-					DevId: p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
-				})
-			} else {
-				// else, up forward teh package
-				// find out which aggregation switch to forward
-				port := host_index/(k*k/2) + k/2
-				fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
-					Dst: vpp.IpNet{
-						Ip:   p.PodInfos.List[host_name].podip,
-						Mask: 16,
-					},
-					Dev:   "memif0/" + strconv.Itoa(port),
-					DevId: p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
-				})
+		if p.Is_Local(access_name) {
+			fat_tree_routes[access_name] = make([]vpp.Route_Info, 0)
+			for host_index, host_name := range hosts {
+				if host_index/(k/2) == access_index {
+					// it access switch and host are linkd, down forward the package
+					// find out which port to forward
+					access_inner_host_id := host_index % (k / 2)
+					port := access_inner_host_id / (k / 2)
+					_, ok := p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)]
+					if !ok {
+						p.Log.Warningln("devid for ", access_name+"-"+strconv.Itoa(port), "not exist")
+					}
+					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
+						Dst: vpp.IpNet{
+							Ip:   p.PodInfos.List[host_name].Podip,
+							Mask: 32,
+						},
+						Dev:     "memif0/" + strconv.Itoa(port),
+						DevId:   p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+						DstName: host_name,
+					})
+				} else {
+					// else, up forward teh package
+					// find out which aggregation switch to forward
+					port := host_index/(k*k/2) + k/2
+					_, ok := p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)]
+					if !ok {
+						p.Log.Warningln("devid for ", access_name+"-"+strconv.Itoa(port), "not exist")
+					}
+					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
+						Dst: vpp.IpNet{
+							Ip:   p.PodInfos.List[host_name].Podip,
+							Mask: 32,
+						},
+						Dev:     "memif0/" + strconv.Itoa(port),
+						DevId:   p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+						DstName: host_name,
+					})
+				}
 			}
 		}
 	}
 
-	p.PodInfos.Lock.Unlock()
-	p.PodIntToVppId.Lock.Unlock()
+	for podname, routes := range fat_tree_routes {
+		fmt.Println("podname =", podname, "its route =")
+		for _, route := range routes {
+			fmt.Println("-----------------route for", podname, "-----------------")
+			fmt.Println("dst =", route.Dst)
+			fmt.Println("gw =", route.Gw)
+			fmt.Println("dev =", route.Dev)
+			fmt.Println("devid =", route.DevId)
+			fmt.Println("dstname =", route.DstName)
+			fmt.Println("-----------------route for", podname, "-----------------")
+		}
+	}
 
+	p.Routes = fat_tree_routes
 	return fat_tree_routes
 }
 
@@ -401,7 +459,7 @@ func (p *Plugin) watch_close_signal(ctx context.Context) error {
 					p.Log.Infoln("received a close signal")
 					p.Linux.RestartVpp()
 					p.CloseSignal = true
-					p.inform_finished("Close")
+					p.ETCD.Inform_finished("Close")
 					break
 				}
 			}
@@ -425,26 +483,20 @@ func (p *Plugin) create_work_directory(dir string) error {
 func (p *Plugin) watch_assignment(ctx context.Context) error {
 	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/assignment/", clientv3.WithPrefix())
 
-	receive_count := 0
 	for {
 		select {
-		case <-time.After(TIMEOUT):
-			if receive_count > 0 {
-				p.create_directory()
-				p.inform_finished("DirectoryCreationFinished")
-				receive_count = 0
-			}
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
-			receive_count += 1
-			err := resp.Err()
-			if err != nil {
-				return err
-			}
 			for _, ev := range resp.Events {
 				if ev.IsCreate() {
-					p.parse_assignment(*ev)
+					//p.Log.Infoln("key =", string(ev.Kv.Key), "value =", string(ev.Kv.Value))
+					if string(ev.Kv.Value) == "done" {
+						p.create_directory()
+						p.ETCD.Inform_finished("DirectoryCreationFinished")
+					} else {
+						p.parse_assignment(*ev)
+					}
 				}
 			}
 		}
@@ -465,7 +517,7 @@ func (p *Plugin) watch_PodType(ctx context.Context) error {
 		select {
 		case <-time.After(TIMEOUT):
 			if receive_count > 0 {
-				p.inform_finished("PodTypeReceiveFinished")
+				p.ETCD.Inform_finished("PodTypeReceiveFinished")
 				receive_count = 0
 			}
 		case <-ctx.Done():
@@ -503,10 +555,9 @@ func (p *Plugin) watch_PodPair(ctx context.Context) error {
 		select {
 		case <-time.After(TIMEOUT):
 			if receive_count > 0 {
-				p.inform_finished("PodPairReceiveFinished")
+				p.ETCD.Inform_finished("PodPairReceiveFinished")
 				receive_count = 0
 			}
-
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
@@ -545,11 +596,12 @@ func (p *Plugin) watch_topo_type(ctx context.Context) error {
 			}
 			for _, ev := range resp.Events {
 				if ev.IsCreate() {
+					//p.Log.Infoln(ev.Kv)
 					if string(ev.Kv.Value) == "fat-tree" {
 						p.TopologyType = "fat-tree"
-						p.inform_finished("TopologyType")
-						return nil
 					}
+					p.ETCD.Inform_finished("TopologyType")
+					return nil
 				}
 			}
 		}
@@ -573,6 +625,41 @@ func (p *Plugin) watch_receiver_ready(ctx context.Context) error {
 	return nil
 }
 
+func (p *Plugin) watch_config_state() {
+	wgs["main"].Wait()
+	p.generate_fattree_routes()
+	for podname, Podinfo := range p.PodInfos.List {
+		if strings.Contains(podname, "h") && p.Is_Local(podname) {
+			mac_addr := p.Linux.Get_MAC_Addr(Podinfo.containerid, podname)
+			p.ETCD.Put("/mocknet/MAC/"+podname, mac_addr)
+		}
+	}
+	p.ETCD.Inform_finished("MACupload")
+	p.ETCD.Wait_for_order("StaticARP")
+
+	ARPs := make(map[string]linux.ARP)
+	resp := p.ETCD.Get("/mocknet/MAC/", true)
+	for _, kv := range resp.Kvs {
+		podname := strings.Split(string(kv.Key), "/")[3]
+		//p.Log.Infoln("podname =", podname)
+		mac_addr := string(kv.Value)
+		ARPs[podname] = linux.ARP{
+			Name: podname,
+			Ip:   p.PodInfos.List[podname].Podip,
+			Mac:  mac_addr,
+		}
+	}
+
+	for podname, _ := range p.PodInfos.List {
+		if strings.Contains(podname, "h") && p.Is_Local(podname) {
+			go p.Linux.Set_Static_ARP(p.PodInfos.List[podname].containerid, podname, ARPs)
+		}
+	}
+
+	p.Log.Infoln("for fat-tree we need to config it as route")
+	p.Set_Routes()
+}
+
 func (p *Plugin) get_receiver_ready() {
 	flag := true
 	for _, podname := range p.LocalPods {
@@ -586,7 +673,7 @@ func (p *Plugin) get_receiver_ready() {
 		}
 	}
 	if flag {
-		p.inform_finished("ReceiverReady")
+		p.ETCD.Inform_finished("ReceiverReady")
 	}
 }
 
@@ -613,8 +700,7 @@ func (p *Plugin) fulltest() {
 		if p.PodType[podname] == "sender" {
 			containerid := p.PodInfos.List[podname].containerid
 			paird_pod := p.PodPair[podname]
-			p.PodInfos.Lock.Lock()
-			dst_ip := p.PodInfos.List[paird_pod].podip
+			dst_ip := p.PodInfos.List[paird_pod].Podip
 			p.Linux.Set_Sender(containerid, podname, dst_ip)
 		}
 	}
@@ -647,9 +733,7 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 			if receive_count > 0 {
 				//p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
 				//p.Log.Infoln("p.MocknetTopology.links =", p.MocknetTopology.links)
-				p.inform_finished("ParseTopologyInfo")
-				routes := p.generate_fattree_routes()
-				fmt.Print(routes)
+				p.ETCD.Inform_finished("ParseTopologyInfo")
 				receive_count = 0
 			}
 		case <-ctx.Done():
@@ -669,13 +753,6 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 			}
 		}
 	}
-}
-
-func (p *Plugin) inform_finished(event string) error {
-	kv := clientv3.NewKV(p.MasterEtcdClient)
-	kv.Put(context.Background(), "/mocknet/"+event+"/"+p.LocalHostName, "done")
-	p.Log.Infoln("informed the master that finished event", event)
-	return nil
 }
 
 func (p *Plugin) translate(event clientv3.Event) error {
@@ -735,6 +812,7 @@ func (p *Plugin) topology_make() error {
 			// -1 represent unalloc
 			infs[inf] = -1
 		}
+		//p.Log.Infoln("debug! for pod", podname, "infs =", infs)
 		pod := Pod{
 			name: podname,
 			infs: infs,
@@ -757,11 +835,13 @@ func (p *Plugin) topology_make() error {
 func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/pods", clientv3.WithPrefix())
 
+	receive_count := 0
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
+			receive_count++
 			err := resp.Err()
 			if err != nil {
 				return err
@@ -771,16 +851,33 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 					panic(err)
 				}
 				if ev.IsCreate() {
-					parse_result := parse_pod_info(*ev)
-					p.PodConfig[parse_result.name] = &sync.RWMutex{}
-					p.Log.Infoln("receive new create pod message for", parse_result.name)
-					p.PodInfos.Lock.Lock()
-					//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
-					p.PodInfos.List[parse_result.name] = parse_result
-					p.PodInfos.Lock.Unlock()
-					//p.Log.Infoln(parse_result.name, "has released the lock of PodInfos")
-					p.Set_Create_Pod(parse_result)
+					if string(ev.Kv.Value) == "done" {
+						go p.watch_config_state()
+					} else {
+						parse_result := parse_pod_info(*ev)
+						//p.PodConfig[parse_result.name] = &sync.RWMutex{}
+						p.Log.Infoln("receive new create pod message for", parse_result.name)
+						p.PodInfos.Lock.Lock()
+						//p.Log.Infoln(parse_result.name, "has got the lock of PodInfos")
+						p.PodInfos.List[parse_result.name] = parse_result
+						islocal := p.Is_Local(parse_result.name)
+						p.PodInfos.Lock.Unlock()
+						//p.Log.Infoln(parse_result.name, "has released the lock of PodInfos")
+
+						if islocal {
+							p.assign_dir_to_pod(parse_result.name)
+							p.Log.Infoln("pod", parse_result.name, "is local")
+							// if the pod is local, add 1 to main waitgroup, and create waitgroup for the pod
+							wgs["main"].Add(1)
+							global_count++
+							//p.Log.Info("the waitgroup of main add 1, now is ", global_count)
+							wgs[parse_result.name] = &sync.WaitGroup{}
+
+							go p.Set_Create_Pod(parse_result)
+						}
+					}
 				} else if ev.IsModify() {
+					receive_count++
 					parse_result := parse_pod_info(*ev)
 					p.Log.Infoln("receive restart pod message for", parse_result.name)
 					p.PodInfos.Lock.Lock()
@@ -800,32 +897,24 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 	}
 }
 
-func (p *Plugin) Set_Create_Pod(parse_result podinfo) error {
-	p.assign_dir_to_pod(parse_result.name)
-	//p.Log.Infoln("parse result =", parse_result)
-	//p.Log.Infoln("pod =", pod)
-	if p.Is_Local(parse_result.name) {
-		p.Log.Infoln("pod", parse_result.name, "is local")
-		pod := p.MocknetTopology.pods[parse_result.name]
-		p.Log.Infoln(pod.name, "is waitting for the lock of PodConfig")
-		p.PodConfig[pod.name].Lock()
-		//p.Log.Infoln(pod.name, "has got the lock of PodConfig")
-		//p.Log.Infoln("pod", pod.name, "is local, so start to config it")
-		if p.Completed_Config(*pod) {
-			p.Set_Connection(*pod)
-		}
-	}
+func (p *Plugin) Set_Create_Pod(parse_result Podinfo) error {
+	pod := p.MocknetTopology.pods[parse_result.name]
+	//p.Log.Infoln(pod.name, "is waitting for the lock of PodConfig")
+	//p.PodConfig[parse_result.name].Lock()
+	//p.Log.Infoln(pod.name, "has got the lock of PodConfig")
+	p.Completed_Config(*pod)
+	go p.Set_Connection(*pod)
 
 	return nil
 }
 
-func (p *Plugin) Set_Recreate_Pod(parse_result podinfo) error {
+func (p *Plugin) Set_Recreate_Pod(parse_result Podinfo) error {
 	//p.assign_dir_to_pod(parse_result.name)
 	pod := p.MocknetTopology.pods[parse_result.name]
 	if p.Is_Local(pod.name) {
 		p.Log.Warningln("received a restart signal fo pod", parse_result.name)
 		p.Log.Infoln("start to reconfig pod", parse_result.name)
-		p.PodConfig[pod.name].Lock()
+		//p.PodConfig[pod.name].Lock()
 		//p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
 		p.Clear_Completed_Config(*pod)
 		if p.Completed_Config(*pod) {
@@ -853,13 +942,19 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		// host-side
 		if result, global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id)); result == vpp.Success {
 			p.Vpp.Set_interface_state_up(global_id)
-			p.InterfaceIDName[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
-			p.InterfaceNameID["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
+			p.InterfaceIDName.Lock.Lock()
+			p.InterfaceNameID.Lock.Lock()
+			p.InterfaceIDName.List[global_id] = "memif" + strconv.Itoa(id) + "/" + strconv.Itoa(vpp_id)
+			p.InterfaceNameID.List["memif"+strconv.Itoa(id)+"/"+strconv.Itoa(vpp_id)] = global_id
+			p.InterfaceIDName.Lock.Unlock()
+			p.InterfaceNameID.Lock.Unlock()
+			p.IntToVppId.Lock.Lock()
 			p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = global_id
+			p.IntToVppId.Lock.Unlock()
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
@@ -869,14 +964,17 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		// int_id is the id in a socket used to identify peer(slave or master)
 		vppresult, pod_memif_id = p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
 		if vppresult == vpp.Success {
+			//p.Log.Info("debug: pod", pod.name, "is waitting for lock of PodIntToVppId")
 			p.PodIntToVppId.Lock.Lock()
+			//p.Log.Info("debug: pod", pod.name, "has got lock of PodIntToVppId")
 			p.PodIntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = pod_memif_id
+			//p.Log.Infoln("for pod", pod.name, pod.name+"-"+strconv.Itoa(vpp_id), " = ", pod_memif_id)
 			p.PodIntToVppId.Lock.Unlock()
 			p.Vpp.Pod_Set_interface_state_up(pod.name, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
@@ -884,37 +982,39 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 
 	// write pod-vpp-tap to pod-vpp-memif route
 	if strings.Contains(pod.name, "h") {
+		//p.Log.Info("debug: pod", pod.name, "is waitting for lock of podinfos")
 		p.PodInfos.Lock.Lock()
+		//p.Log.Info("debug: pod", pod.name, "has got lock of podinfos")
 		containerid := p.PodInfos.List[pod.name].containerid
-		podip := p.PodInfos.List[pod.name].podip
+		podip := p.PodInfos.List[pod.name].Podip
 		p.PodInfos.Lock.Unlock()
 
 		var tap_id uint32
 		if vppresult, tap_id = p.Vpp.Pod_Create_Tap(pod.name); vppresult != vpp.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 		if vppresult = p.Vpp.Pod_Set_interface_state_up(pod.name, tap_id); vppresult != vpp.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 		if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 		if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
@@ -922,7 +1022,7 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		// write pod-vpp to pod pod-linux route
 		if vppresult = p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
 			Dst: vpp.IpNet{
-				Ip:   p.PodInfos.List[pod.name].podip,
+				Ip:   p.PodInfos.List[pod.name].Podip,
 				Mask: 32,
 			},
 			Dev:   "tap0",
@@ -933,24 +1033,27 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
 			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
+			//p.PodConfig[pod.name].Unlock()
 			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
 			return false
 		}
 
 	} else if strings.Contains(pod.name, "s") {
-		// bridge interfaces in switch pod together
-		ints_id := make([]uint32, 0)
-		for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
-			ints_id = append(ints_id, uint32(i+1))
+		if p.TopologyType == "other" {
+			// bridge interfaces in switch pod together
+			ints_id := make([]uint32, 0)
+			for i := 0; i < len(p.MocknetTopology.pods[pod.name].infs); i++ {
+				ints_id = append(ints_id, uint32(i+1))
+			}
+			if vppresult = p.Vpp.Pod_Bridge(pod.name, ints_id, 1); vppresult != vpp.Success {
+				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
+				//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
+				//p.PodConfig[pod.name].Unlock()
+				//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
+				return false
+			}
 		}
-		if vppresult = p.Vpp.Pod_Bridge(pod.name, ints_id, 1); vppresult != vpp.Success {
-			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
-		}
+		// fat-tree topology switch will be config after all done
 	} else {
 		p.Log.Errorln("the judgement name is ", pod.name)
 		panic("pod type judgement error!")
@@ -978,31 +1081,43 @@ func (p *Plugin) Clear_Completed_Config(pod Pod) error {
 	return nil
 }
 
-type Vxlan_Count_Sync struct {
-	lock  *sync.RWMutex
-	count int
-}
-
 func (p *Plugin) Set_Connection(pod Pod) error {
-	vxlan_total := 0
-	for _, link := range pod.links {
-		if p.Is_Local(link.pod1) && !p.Is_Local(link.pod2) {
-			vxlan_total += 1
-		}
-	}
+	link_total := len(pod.links)
 
-	vxlan_count := Vxlan_Count_Sync{
-		lock:  &sync.RWMutex{},
-		count: 0,
-	}
+	// add the count of links to the pod's waitgroup
+	wgs[pod.name].Add(link_total)
+	//p.Log.Infoln("debug: ", pod.name, wgs[pod.name])
+	p.Log.Info("the waitgroup of ", pod.name, " set to ", link_total)
 	// host-side vpp config
 	for _, link := range pod.links {
-		go p.Connect(link, &vxlan_count, vxlan_total)
+		go p.Connect(link)
 	}
+	// wait for all link configured finishing
+	wgs[pod.name].Wait()
+	// mark the config of this pod has finished
+	wgs["main"].Done()
+	global_count--
+	//p.Log.Info("the waitgroup of main reduce 1, now is ", global_count)
+	//p.PodConfig[pod.name].Unlock()
+	p.Log.Infoln("---------------- config for", pod.name, "finished ----------------")
+
 	return nil
 }
 
-func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total int) error {
+func (p *Plugin) Set_Routes() error {
+	for podname, routes := range p.Routes {
+		for _, route := range routes {
+			if p.Is_Local(podname) {
+				p.Vpp.Pod_Add_Route(podname, route)
+			}
+		}
+	}
+	p.Log.Infoln("all routes of fat-tree has been configured")
+
+	return nil
+}
+
+func (p *Plugin) Connect(link Link) error {
 	var dst, src string
 	var vni uint32
 	var Is_Local1, Is_Local2 bool
@@ -1013,11 +1128,12 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 		// it means that dst pod's info hasn't been received, wait until it does
 		p.PodInfos.Lock.Lock()
 		p.NodeInfos.Lock.Lock()
-		//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
-		//p.Log.Infoln(link.pod1, "has got the lock of NodeInfos")
+		//p.Log.Infoln("debug:", link.pod1, "has got the lock of PodInfos")
+		//p.Log.Infoln("debug:", link.pod1, "has got the lock of NodeInfos")
 
 		pod2host := p.PodInfos.List[link.pod2].hostname
-		//p.Log.Infoln(link.pod1, ":    pod2host =", pod2host)
+		//p.Log.Infoln("pod1", link.pod1, ", pod2", link.pod2, ", pod2host =", pod2host)
+		//p.Log.Infoln("podeinfos =", p.PodInfos)
 		if pod2host != "" {
 			dst = p.NodeInfos.List[pod2host].vtepip
 			Is_Local1 = p.Is_Local(link.pod1)
@@ -1047,7 +1163,24 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 
 	if Is_Local1 && Is_Local2 {
 		// for both locals, xconnect them together
-		go p.direct_xconnect(link)
+		for {
+			//p.Log.Info("debug: pod", link.pod1, "is waitting for the lock of IntToVppId")
+			p.IntToVppId.Lock.Lock()
+			//p.Log.Info("debug: pod", link.pod1, "has got the lock of IntToVppId")
+			intf1_id, ok1 := p.IntToVppId.List[link.pod1+"-"+link.pod1inf]
+			intf2_id, ok2 := p.IntToVppId.List[link.pod2+"-"+link.pod2inf]
+			p.IntToVppId.Lock.Unlock()
+
+			// waitting for the pod2's memif interface to be created
+			if ok1 && ok2 {
+				//p.Log.Info("the infomation of ", link.pod1, " and pod ", link.pod2, "have both got")
+				p.Vpp.XConnect(intf1_id, intf2_id)
+				wgs[link.pod1].Done()
+				//p.Log.Infoln("debug: ", link.pod1, wgs[link.pod1])
+				//p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
+				break
+			}
+		}
 	} else if Is_Local1 && !Is_Local2 {
 		// for intf1 is local and intf2 not, create vxlan tunnel and xconnect intf1 with it
 		src = p.Addresses.local_vtep_address
@@ -1059,53 +1192,27 @@ func (p *Plugin) Connect(link Link, vxlan_count *Vxlan_Count_Sync, vxlan_total i
 			if result == vpp.Success {
 				vxlan_id = id
 				p.IntToVppId.Lock.Lock()
-				//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has got the lock of IntToVppId")
 				p.IntToVppId.List[vxlan_name] = vxlan_id
-				p.IntToVppId.Lock.Unlock()
-				//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
 			} else if result == vpp.AlreadyExist {
 				p.IntToVppId.Lock.Lock()
-				//p.Log.Infoln(link.pod1, "has got the lock of PodInfos")
+				//p.Log.Infoln(link.pod1, "has got the lock of IntToVppId")
 				vxlan_id = p.IntToVppId.List[vxlan_name]
-				p.IntToVppId.Lock.Unlock()
-				//p.Log.Infoln(link.pod1, "has released the lock of PodInfos")
 			}
-			p.IntToVppId.Lock.Lock()
-			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], vxlan_id)
-			p.Vpp.XConnect(vxlan_id, p.IntToVppId.List[link.pod1+"-"+link.pod1inf])
+			intf1_id := p.IntToVppId.List[link.pod1+"-"+link.pod1inf]
 			p.IntToVppId.Lock.Unlock()
+			p.Vpp.XConnect(intf1_id, vxlan_id)
+			p.Vpp.XConnect(vxlan_id, intf1_id)
 		}
-		vxlan_count.lock.Lock()
-		vxlan_count.count += 1
-		p.Log.Infoln("now vxlan_count =", vxlan_count.count, "total =", vxlan_total)
-		if vxlan_count.count == vxlan_total {
-			//p.Log.Infoln(link.pod1, "is going to release the lock of PodConfig")
-			p.PodConfig[link.pod1].Unlock()
-			//p.Log.Infoln(link.pod1, "has released the lock of PodConfig")
-			p.Log.Infoln("---------------- config for", link.pod1, "finished ----------------")
-		}
-		vxlan_count.lock.Unlock()
+		wgs[link.pod1].Done()
+		//p.Log.Infoln("debug: ", link.pod1, wgs[link.pod1])
+		//p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
 	}
 
 	return nil
 }
 
-func (p *Plugin) direct_xconnect(link Link) error {
-	for {
-		p.IntToVppId.Lock.Lock()
-		intf2_id, ok := p.IntToVppId.List[link.pod2+"-"+link.pod2inf]
-		p.IntToVppId.Lock.Unlock()
-		// waitting for the pod2's memif interface to be created
-		if ok {
-			p.Vpp.XConnect(p.IntToVppId.List[link.pod1+"-"+link.pod1inf], intf2_id)
-			break
-		}
-		time.Sleep(time.Second)
-	}
-	return nil
-}
-
-func parse_pod_info(event clientv3.Event) podinfo {
+func parse_pod_info(event clientv3.Event) Podinfo {
 	v := string(event.Kv.Value)
 	split_info := strings.Split(v, ",")
 	restart_count, err := strconv.Atoi(strings.Split(split_info[5], ":")[1])
@@ -1113,10 +1220,10 @@ func parse_pod_info(event clientv3.Event) podinfo {
 		panic("restart count is invalid")
 	}
 	//fmt.Println("name=", strings.Split(split_info[0], ":")[1], ", dockerid=", strings.Split(split_info[6], ":")[1])
-	return podinfo{
+	return Podinfo{
 		name:         strings.Split(split_info[0], ":")[1],
 		namespace:    strings.Split(split_info[1], ":")[1],
-		podip:        strings.Split(split_info[2], ":")[1],
+		Podip:        strings.Split(split_info[2], ":")[1],
 		hostip:       strings.Split(split_info[3], ":")[1],
 		hostname:     strings.Split(split_info[4], ":")[1],
 		restartcount: restart_count,
@@ -1149,6 +1256,7 @@ func (p *Plugin) get_socket_id(name string) int {
 }
 
 func (pod Pod) alloc_interface_id() error {
+	//fmt.Println("for pod ", pod.name, "infts =", pod.infs)
 	for mininet_name, _ := range pod.infs {
 		translate, err := strconv.Atoi(mininet_name)
 		if err != nil {
