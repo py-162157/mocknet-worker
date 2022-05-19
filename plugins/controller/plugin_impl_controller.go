@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -47,8 +48,10 @@ type Deps struct {
 	ETCD  *etcd.Plugin
 
 	MocknetTopology NetTopo
-	PodInfos        PodInfosSync
-	NodeInfos       NodeInfosSync
+	// PodSet donot contain switch node, while podinfos dose
+	PodInfos  PodInfosSync
+	NodeInfos NodeInfosSync
+	// PodSet contain switch node, while podinfos not
 	PodSet          map[string]map[string]string
 	DirAssign       []string // really needed?
 	DirPrefix       string
@@ -59,13 +62,14 @@ type Deps struct {
 	IntToVppId      IntToVppIdSync // key: interface name (podname-interfaceid), value: interface id in host-side vpp
 	LocalHostName   string
 	//PodConfig       map[string]*sync.RWMutex // only the routine that got the pod's lock can config it
-	LocalPods     []string
-	PodType       map[string]string           // for fat-tree bin test, mark host as sender or receiver
-	PodPair       map[string]string           // pod pair for test (sender-receiver)
-	TopologyType  string                      // fat-tree or other
-	PodIntToVppId PodIntToVppIdSync           // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
-	Routes        map[string][]vpp.Route_Info // route for all pods
-	WaitGroups    map[string]sync.WaitGroup
+	LocalPods         []string
+	PodType           map[string]string           // for fat-tree bin test, mark host as sender or receiver
+	PodPair           map[string]string           // pod pair for test (sender-receiver)
+	TopologyType      string                      // fat-tree or other
+	PodIntToVppId     PodIntToVppIdSync           // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
+	Routes            map[string][]vpp.Route_Info // route for all pods
+	WaitGroups        map[string]sync.WaitGroup
+	FatTreeRouteOrder map[string]map[int]int // key: the order of switches' ports, value: the memif id of these ports
 
 	Log logging.PluginLogger
 }
@@ -126,6 +130,8 @@ type Podinfo struct {
 type NetTopo struct {
 	pods  map[string]*Pod
 	links []Link
+	// key: h1s10-0, value: h1s1-s10
+	linkmap map[string]string
 }
 
 type Pod struct {
@@ -134,15 +140,19 @@ type Pod struct {
 	// value: interface id in vpp
 	infs  map[string]int
 	links []Link
+	// only used in fat-tree topology
+	fat_tree_addr string
 }
 
 type Link struct {
-	name    string
-	pod1    string
-	pod2    string
-	pod1inf string
-	pod2inf string
-	vni     int
+	name      string
+	pod1      string
+	pod2      string
+	pod1inf   string
+	pod2inf   string
+	vni       int
+	intf1addr string
+	intf2addr string
 }
 
 func (p *Plugin) Init() error {
@@ -157,8 +167,9 @@ func (p *Plugin) Init() error {
 	p.create_work_directory(p.DirPrefix)
 
 	p.MocknetTopology = NetTopo{
-		pods:  make(map[string]*Pod),
-		links: make([]Link, 0),
+		pods:    make(map[string]*Pod),
+		links:   make([]Link, 0),
+		linkmap: make(map[string]string),
 	}
 	p.PodSet = make(map[string]map[string]string)
 	p.PodInfos = PodInfosSync{
@@ -194,6 +205,7 @@ func (p *Plugin) Init() error {
 	p.Routes = make(map[string][]vpp.Route_Info)
 	p.TopologyType = "other"
 	wgs["main"] = &sync.WaitGroup{}
+	p.FatTreeRouteOrder = make(map[string]map[int]int)
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -330,12 +342,13 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 				}
 				fat_tree_routes[core_name] = append(fat_tree_routes[core_name], vpp.Route_Info{
 					Dst: vpp.IpNet{
-						Ip:   p.PodInfos.List[host_name].Podip, // now maybe not received, so take replace by DstName domain
+						Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr, // now maybe not received, so take replace by DstName domain
 						Mask: 32,
 					},
 					Dev:     "memif0/" + strconv.Itoa(port),
-					DevId:   p.PodIntToVppId.List[core_name+"-"+strconv.Itoa(port)],
+					DevId:   uint32(p.FatTreeRouteOrder[core_name][port]),
 					DstName: host_name, // read DstIp by DstName after received the pod's ip address
+					Port:    uint32(port),
 				})
 			}
 		}
@@ -357,12 +370,13 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					}
 					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
-							Ip:   p.PodInfos.List[host_name].Podip,
+							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
 						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+						DevId:   uint32(p.FatTreeRouteOrder[aggregation_name][port]),
 						DstName: host_name,
+						Port:    uint32(port),
 					})
 				} else {
 					// else, up forward the package
@@ -374,12 +388,13 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					}
 					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
-							Ip:   p.PodInfos.List[host_name].Podip,
+							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
 						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)],
+						DevId:   uint32(p.FatTreeRouteOrder[aggregation_name][port]),
 						DstName: host_name,
+						Port:    uint32(port),
 					})
 				}
 			}
@@ -394,20 +409,20 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 				if host_index/(k/2) == access_index {
 					// it access switch and host are linkd, down forward the package
 					// find out which port to forward
-					access_inner_host_id := host_index % (k / 2)
-					port := access_inner_host_id / (k / 2)
+					port := host_index % (k / 2)
 					_, ok := p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)]
 					if !ok {
 						p.Log.Warningln("devid for ", access_name+"-"+strconv.Itoa(port), "not exist")
 					}
 					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
-							Ip:   p.PodInfos.List[host_name].Podip,
+							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
 						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+						DevId:   uint32(p.FatTreeRouteOrder[access_name][port]),
 						DstName: host_name,
+						Port:    uint32(port),
 					})
 				} else {
 					// else, up forward teh package
@@ -419,30 +434,31 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					}
 					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
-							Ip:   p.PodInfos.List[host_name].Podip,
+							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
 						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   p.PodIntToVppId.List[access_name+"-"+strconv.Itoa(port)],
+						DevId:   uint32(p.FatTreeRouteOrder[access_name][port]),
 						DstName: host_name,
+						Port:    uint32(port),
 					})
 				}
 			}
 		}
 	}
 
-	for podname, routes := range fat_tree_routes {
-		fmt.Println("podname =", podname, "its route =")
+	/*for podname, routes := range fat_tree_routes {
 		for _, route := range routes {
 			fmt.Println("-----------------route for", podname, "-----------------")
 			fmt.Println("dst =", route.Dst)
 			fmt.Println("gw =", route.Gw)
+			fmt.Println("port =", route.Port)
 			fmt.Println("dev =", route.Dev)
 			fmt.Println("devid =", route.DevId)
 			fmt.Println("dstname =", route.DstName)
 			fmt.Println("-----------------route for", podname, "-----------------")
 		}
-	}
+	}*/
 
 	p.Routes = fat_tree_routes
 	return fat_tree_routes
@@ -610,12 +626,13 @@ func (p *Plugin) watch_topo_type(ctx context.Context) error {
 
 func (p *Plugin) watch_receiver_ready(ctx context.Context) error {
 	for {
-		resp, err := p.MasterEtcdClient.Get(context.Background(), "mocknet/command/GetReceiverReady")
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/command/GetReceiverReady")
 		if err != nil {
 			p.Log.Errorln("failed to probe GetReceiverReady command")
 		} else {
 			if len(resp.Kvs) != 0 {
 				if string(resp.Kvs[0].Value) == "true" {
+					p.Log.Infoln("receive a command to get receivers ready")
 					p.get_receiver_ready()
 					break
 				}
@@ -637,22 +654,77 @@ func (p *Plugin) watch_config_state() {
 	p.ETCD.Inform_finished("MACupload")
 	p.ETCD.Wait_for_order("StaticARP")
 
-	ARPs := make(map[string]linux.ARP)
+	RouteMap := make(map[string]map[string]vpp.Route_Info)
+	for podname, routes := range p.Routes {
+		RouteMap[podname] = make(map[string]vpp.Route_Info)
+		for _, route := range routes {
+			RouteMap[podname][route.Dst.Ip] = route
+		}
+	}
+
+	LinuxARPs := make(map[string]linux.ARP)
+	VppARPs := make(map[string][]vpp.ARP)
+	swnames := make([]string, 0)
+	for _, pod := range p.MocknetTopology.pods {
+		if !strings.Contains(pod.name, "h") {
+			VppARPs[pod.name] = make([]vpp.ARP, 0)
+			swnames = append(swnames, pod.name)
+		}
+	}
 	resp := p.ETCD.Get("/mocknet/MAC/", true)
 	for _, kv := range resp.Kvs {
 		podname := strings.Split(string(kv.Key), "/")[3]
 		//p.Log.Infoln("podname =", podname)
 		mac_addr := string(kv.Value)
-		ARPs[podname] = linux.ARP{
+		dst_ip := p.MocknetTopology.pods[podname].fat_tree_addr
+
+		LinuxARPs[podname] = linux.ARP{
 			Name: podname,
-			Ip:   p.PodInfos.List[podname].Podip,
+			Ip:   dst_ip,
 			Mac:  mac_addr,
+		}
+
+		for _, swname := range swnames {
+			VppARPs[swname] = append(VppARPs[swname], vpp.ARP{
+				Int_id: uint(RouteMap[swname][dst_ip].DevId),
+				Ip:     dst_ip,
+				Mac:    mac_addr,
+			})
 		}
 	}
 
-	for podname, _ := range p.PodInfos.List {
-		if strings.Contains(podname, "h") && p.Is_Local(podname) {
-			go p.Linux.Set_Static_ARP(p.PodInfos.List[podname].containerid, podname, ARPs)
+	IntfAddrMap := make(map[string]map[string]string)
+	for _, link := range p.MocknetTopology.links {
+		if _, ok := IntfAddrMap[link.pod1]; ok {
+			IntfAddrMap[link.pod1][link.pod1inf] = link.intf1addr
+		} else {
+			IntfAddrMap[link.pod1] = make(map[string]string)
+			IntfAddrMap[link.pod1][link.pod1inf] = link.intf1addr
+		}
+		if _, ok := IntfAddrMap[link.pod2]; ok {
+			IntfAddrMap[link.pod2][link.pod2inf] = link.intf2addr
+		} else {
+			IntfAddrMap[link.pod2] = make(map[string]string)
+			IntfAddrMap[link.pod1][link.pod1inf] = link.intf1addr
+		}
+	}
+
+	// Static ARP config
+	for podname, _ := range p.PodSet {
+		if p.Is_Local(podname) {
+			if strings.Contains(podname, "h") {
+				go p.Linux.Set_Static_ARP(p.PodInfos.List[podname].containerid, podname, LinuxARPs)
+			} else {
+				// Set ip address for switch interface
+				for id, addr := range IntfAddrMap[podname] {
+					vpp_id := p.PodIntToVppId.List[podname+"-"+id]
+					p.Vpp.Pod_Set_Interface_Ip(podname, vpp_id, vpp.IpNet{
+						Ip:   addr,
+						Mask: 30,
+					})
+				}
+				go p.Vpp.Pod_Set_Static_ARP(podname, VppARPs[podname])
+			}
 		}
 	}
 
@@ -662,10 +734,16 @@ func (p *Plugin) watch_config_state() {
 
 func (p *Plugin) get_receiver_ready() {
 	flag := true
+	p.Log.Infoln("debug!! localpod =", p.LocalPods)
+	p.Log.Infoln("debug!! podtype =", p.PodType)
+	p.Log.Infoln("debug!! podpair =", p.PodPair)
 	for _, podname := range p.LocalPods {
+		p.Log.Infoln("pod", podname, "is local")
 		if p.PodType[podname] == "receiver" {
+			p.Log.Infoln("pod", podname, "is local and receiver")
 			containerid := p.PodInfos.List[podname].containerid
 			result := p.Linux.Set_Receiver(containerid, podname)
+			p.Log.Infoln("for pod", podname, "receiver ready result =", result)
 			if result != linux.Success {
 				// cann't set iperf3 server for all local receiver
 				flag = false
@@ -679,13 +757,20 @@ func (p *Plugin) get_receiver_ready() {
 
 func (p *Plugin) watch_test_command(ctx context.Context) error {
 	for {
-		resp, err := p.MasterEtcdClient.Get(context.Background(), "mocknet/command/FullTest")
+		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/command/FullTest")
 		if err != nil {
 			p.Log.Errorln("failed to probe FullTest command")
 		} else {
 			if len(resp.Kvs) != 0 {
 				if string(resp.Kvs[0].Value) == "true" {
-					p.fulltest()
+					for _, podname := range p.LocalPods {
+						if p.PodType[podname] == "sender" {
+							containerid := p.PodInfos.List[podname].containerid
+							paird_pod := p.PodPair[podname]
+							dst_ip := p.MocknetTopology.pods[paird_pod].fat_tree_addr
+							go p.speedtest(containerid, podname, dst_ip)
+						}
+					}
 					break
 				}
 			}
@@ -694,16 +779,11 @@ func (p *Plugin) watch_test_command(ctx context.Context) error {
 	return nil
 }
 
-func (p *Plugin) fulltest() {
-	//flag := true
-	for _, podname := range p.LocalPods {
-		if p.PodType[podname] == "sender" {
-			containerid := p.PodInfos.List[podname].containerid
-			paird_pod := p.PodPair[podname]
-			dst_ip := p.PodInfos.List[paird_pod].Podip
-			p.Linux.Set_Sender(containerid, podname, dst_ip)
-		}
-	}
+func (p *Plugin) speedtest(container_id string, pod_name string, dst_ip string) {
+	_, output := p.Linux.Set_Sender(container_id, pod_name, dst_ip)
+	p.Log.Infoln("------------------- output of pod", pod_name, "-------------------")
+	p.Log.Infoln(strings.Split(output, "- - - - - - - - - - - - - - - - - - - - - - - - -")[1])
+	p.Log.Infoln("------------------- output of pod", pod_name, "-------------------")
 }
 
 func (p *Plugin) parse_assignment(event clientv3.Event) {
@@ -726,29 +806,35 @@ func (p *Plugin) watch_topology(ctx context.Context) error {
 
 	watchChan := p.MasterEtcdClient.Watch(context.Background(), "/mocknet/link/", clientv3.WithPrefix(), clientv3.WithRev(getResp.Header.Revision+1))
 
-	receive_count := 0
 	for {
 		select {
-		case <-time.After(TIMEOUT):
-			if receive_count > 0 {
-				//p.Log.Infoln("p.MocknetTopology.pods =", p.MocknetTopology.pods)
-				//p.Log.Infoln("p.MocknetTopology.links =", p.MocknetTopology.links)
-				p.ETCD.Inform_finished("ParseTopologyInfo")
-				receive_count = 0
-			}
 		case <-ctx.Done():
 			return nil
 		case resp := <-watchChan:
-			receive_count += 1
 			err := resp.Err()
 			if err != nil {
 				return err
 			}
 			for _, ev := range resp.Events {
 				if ev.IsCreate() {
-					//p.Log.Infoln("receive a link infomation, key =", string(ev.Kv.Key), ", value =", string(ev.Kv.Value))
-					p.translate(*ev)
-					p.topology_make()
+					if string(ev.Kv.Value) == "done" {
+						p.ETCD.Inform_finished("ParseTopologyInfo")
+						for _, link := range p.MocknetTopology.links {
+							if strings.Contains(link.pod1, "h") {
+								p.MocknetTopology.pods[link.pod1].fat_tree_addr = link.intf1addr
+								//p.Log.Infoln("fat-tree address of", link.pod1, "is", link.intf1addr)
+							}
+							if strings.Contains(link.pod2, "h") {
+								p.MocknetTopology.pods[link.pod2].fat_tree_addr = link.intf2addr
+								//p.Log.Infoln("fat-tree address of", link.pod2, "is", link.intf2addr)
+							}
+							p.MocknetTopology.linkmap[link.pod1+"-"+link.pod1inf] = link.pod1 + "-" + link.pod2
+						}
+					} else {
+						//p.Log.Infoln("receive a link infomation, key =", string(ev.Kv.Key), ", value =", string(ev.Kv.Value))
+						p.translate(*ev)
+						p.topology_make()
+					}
 				}
 			}
 		}
@@ -763,6 +849,10 @@ func (p *Plugin) translate(event clientv3.Event) error {
 	node2 := strings.Split(split_link[1], ":")[1]
 	node1_inf := strings.Split(split_link[2], ":")[1]
 	node2_inf := strings.Split(split_link[3], ":")[1]
+	intf1addr := strings.Split(split_link[5], ":")[1]
+	intf2addr := strings.Split(split_link[6], ":")[1]
+	//p.Log.Infoln("intf1addr =", intf1addr)
+	//p.Log.Infoln("intf2addr =", intf2addr)
 	vni, err := strconv.Atoi(strings.Split(split_link[4], ":")[1])
 	if err != nil {
 		panic(err)
@@ -793,12 +883,14 @@ func (p *Plugin) translate(event clientv3.Event) error {
 	// generate topology-links
 	p.MocknetTopology.links = append(p.MocknetTopology.links,
 		Link{
-			name:    node1 + "-" + node2,
-			pod1:    node1,
-			pod2:    node2,
-			pod1inf: node1_inf,
-			pod2inf: node2_inf,
-			vni:     vni,
+			name:      node1 + "-" + node2,
+			pod1:      node1,
+			pod2:      node2,
+			pod1inf:   node1_inf,
+			pod2inf:   node2_inf,
+			vni:       vni,
+			intf1addr: intf1addr,
+			intf2addr: intf2addr,
 		},
 	)
 
@@ -870,7 +962,7 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 							// if the pod is local, add 1 to main waitgroup, and create waitgroup for the pod
 							wgs["main"].Add(1)
 							global_count++
-							//p.Log.Info("the waitgroup of main add 1, now is ", global_count)
+							p.Log.Info("the waitgroup of main add 1, now is ", global_count)
 							wgs[parse_result.name] = &sync.WaitGroup{}
 
 							go p.Set_Create_Pod(parse_result)
@@ -890,7 +982,7 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 					}
 
 					// to be convenient, assume that if value changes, mean restart of the pod
-					p.Set_Recreate_Pod(parse_result)
+					//p.Set_Recreate_Pod(parse_result)
 				}
 			}
 		}
@@ -899,33 +991,7 @@ func (p *Plugin) watch_pods_creation(ctx context.Context) error {
 
 func (p *Plugin) Set_Create_Pod(parse_result Podinfo) error {
 	pod := p.MocknetTopology.pods[parse_result.name]
-	//p.Log.Infoln(pod.name, "is waitting for the lock of PodConfig")
-	//p.PodConfig[parse_result.name].Lock()
-	//p.Log.Infoln(pod.name, "has got the lock of PodConfig")
-	p.Completed_Config(*pod)
-	go p.Set_Connection(*pod)
 
-	return nil
-}
-
-func (p *Plugin) Set_Recreate_Pod(parse_result Podinfo) error {
-	//p.assign_dir_to_pod(parse_result.name)
-	pod := p.MocknetTopology.pods[parse_result.name]
-	if p.Is_Local(pod.name) {
-		p.Log.Warningln("received a restart signal fo pod", parse_result.name)
-		p.Log.Infoln("start to reconfig pod", parse_result.name)
-		//p.PodConfig[pod.name].Lock()
-		//p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
-		p.Clear_Completed_Config(*pod)
-		if p.Completed_Config(*pod) {
-			p.Set_Connection(*pod)
-		}
-	}
-
-	return nil
-}
-
-func (p *Plugin) Completed_Config(pod Pod) bool {
 	// create memif socket
 	id := p.get_socket_id(pod.name) + 1
 	filedir := p.DirPrefix + pod.name
@@ -939,6 +1005,7 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 	var linuxresult linux.ProcessResult
 
 	for _, vpp_id := range pod.infs {
+		//p.Log.Errorln("for pod ", pod.name, "loop i =", i)
 		// host-side
 		if result, global_id := p.Vpp.Create_Memif_Interface("master", uint32(vpp_id), uint32(id)); result == vpp.Success {
 			p.Vpp.Set_interface_state_up(global_id)
@@ -953,30 +1020,34 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 			p.IntToVppId.Lock.Unlock()
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
-
 		// pod-side
 		inf_name := "memif" + strconv.Itoa(vpp_id)
 		// int_id is the id in a socket used to identify peer(slave or master)
 		vppresult, pod_memif_id = p.Vpp.Pod_Create_Memif_Interface(pod.name, "slave", inf_name, uint32(vpp_id))
 		if vppresult == vpp.Success {
-			//p.Log.Info("debug: pod", pod.name, "is waitting for lock of PodIntToVppId")
 			p.PodIntToVppId.Lock.Lock()
-			//p.Log.Info("debug: pod", pod.name, "has got lock of PodIntToVppId")
 			p.PodIntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)] = pod_memif_id
-			//p.Log.Infoln("for pod", pod.name, pod.name+"-"+strconv.Itoa(vpp_id), " = ", pod_memif_id)
 			p.PodIntToVppId.Lock.Unlock()
+
+			//p.Log.Warningln("debug!!", "podside", pod.name+"-"+strconv.Itoa(vpp_id), "=", pod_memif_id, " the link =", p.MocknetTopology.linkmap[pod.name+"-"+strconv.Itoa(vpp_id)])
+			if p.TopologyType == "fat-tree" && !strings.Contains(pod.name, "h") {
+				linkname := p.MocknetTopology.linkmap[pod.name+"-"+strconv.Itoa(vpp_id)]
+				pod1 := strings.Split(linkname, "-")[0]
+				pod2 := strings.Split(linkname, "-")[1]
+				order := p.get_fat_tree_port_order(pod1, pod2)
+				if _, ok := p.FatTreeRouteOrder[pod1]; !ok {
+					p.FatTreeRouteOrder[pod1] = make(map[int]int)
+				}
+				p.FatTreeRouteOrder[pod1][order] = int(pod_memif_id)
+				p.Log.Infoln("for pod", pod.name, "link ", pod1, "to", pod2, " = ", pod_memif_id)
+			}
+
 			p.Vpp.Pod_Set_interface_state_up(pod.name, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
 	}
 
@@ -986,56 +1057,55 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		p.PodInfos.Lock.Lock()
 		//p.Log.Info("debug: pod", pod.name, "has got lock of podinfos")
 		containerid := p.PodInfos.List[pod.name].containerid
-		podip := p.PodInfos.List[pod.name].Podip
+		var podip string
+		var masklen string
+		if p.TopologyType == "fat-tree" {
+			// use ip addr in /mocknet/links
+			podip = p.MocknetTopology.pods[pod.name].fat_tree_addr
+			masklen = "/30"
+		} else {
+			// use ip addr based on control plane
+			podip = p.PodInfos.List[pod.name].Podip
+			masklen = "/16"
+		}
+		//p.Log.Infoln("for pod ", pod.name, "podip =", podip)
 		p.PodInfos.Lock.Unlock()
 
 		var tap_id uint32
 		if vppresult, tap_id = p.Vpp.Pod_Create_Tap(pod.name); vppresult != vpp.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
 		if vppresult = p.Vpp.Pod_Set_interface_state_up(pod.name, tap_id); vppresult != vpp.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
 		if linuxresult = p.Linux.Pod_Add_Route(containerid, pod.name); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
-		if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip); linuxresult != linux.Success {
+		if linuxresult = p.Linux.Pod_Set_Ip(containerid, pod.name, podip, masklen); linuxresult != linux.Success {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
 
 		// write pod-vpp to pod pod-linux route
-		if vppresult = p.Vpp.Pod_Add_Route(pod.name, vpp.Route_Info{
-			Dst: vpp.IpNet{
-				Ip:   p.PodInfos.List[pod.name].Podip,
-				Mask: 32,
+		route_info := []vpp.Route_Info{
+			{
+				Dst: vpp.IpNet{
+					Ip:   p.PodInfos.List[pod.name].Podip,
+					Mask: 32,
+				},
+				Dev:   "tap0",
+				DevId: uint32(1),
 			},
-			Dev:   "tap0",
-			DevId: uint32(1),
-		}); vppresult == vpp.Success {
+		}
+		if vppresult = p.Vpp.Pod_Add_Route(pod.name, route_info); vppresult == vpp.Success {
 			p.Vpp.Pod_Xconnect(pod.name, pod_memif_id, tap_id)
 			p.Vpp.Pod_Xconnect(pod.name, tap_id, pod_memif_id)
 		} else {
 			p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-			//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-			//p.PodConfig[pod.name].Unlock()
-			//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-			return false
+			return errors.New("interrupted")
 		}
 
 	} else if strings.Contains(pod.name, "s") {
@@ -1047,10 +1117,7 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 			}
 			if vppresult = p.Vpp.Pod_Bridge(pod.name, ints_id, 1); vppresult != vpp.Success {
 				p.Log.Warningln("config for pod", pod.name, "has been interrupted")
-				//p.Log.Infoln(pod.name, "is going to release the lock of PodConfig")
-				//p.PodConfig[pod.name].Unlock()
-				//p.Log.Infoln(pod.name, "has released the lock of PodConfig")
-				return false
+				return errors.New("interrupted")
 			}
 		}
 		// fat-tree topology switch will be config after all done
@@ -1058,30 +1125,8 @@ func (p *Plugin) Completed_Config(pod Pod) bool {
 		p.Log.Errorln("the judgement name is ", pod.name)
 		panic("pod type judgement error!")
 	}
-	return true
-}
 
-func (p *Plugin) Clear_Completed_Config(pod Pod) error {
-	/*id := p.get_socket_id(pod.name) + 1
-	p.Vpp.DeleteSocket(uint32(id))*/
-
-	p.Log.Infoln("deleting host-side memif interface for pod", pod.name)
-	for _, vpp_id := range pod.infs {
-		memif_int_id := p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)]
-		p.Vpp.Delete_Memif_Interface(memif_int_id)
-	}
-
-	// no need to delete vxlan tunnel for now
-	/*for int_name, vpp_id := range p.IntToVppId.List {
-		if strings.Split(int_name, "-")[1] == pod.name {
-			p.Vpp.Delete_Vxlan_Tunnel(vpp_id)
-		}
-	}*/
-
-	return nil
-}
-
-func (p *Plugin) Set_Connection(pod Pod) error {
+	// set connection
 	link_total := len(pod.links)
 
 	// add the count of links to the pod's waitgroup
@@ -1097,19 +1142,47 @@ func (p *Plugin) Set_Connection(pod Pod) error {
 	// mark the config of this pod has finished
 	wgs["main"].Done()
 	global_count--
-	//p.Log.Info("the waitgroup of main reduce 1, now is ", global_count)
+	p.Log.Info("the waitgroup of main reduce 1, now is ", global_count)
 	//p.PodConfig[pod.name].Unlock()
 	p.Log.Infoln("---------------- config for", pod.name, "finished ----------------")
 
 	return nil
 }
 
+/*func (p *Plugin) Set_Recreate_Pod(parse_result Podinfo) error {
+	//p.assign_dir_to_pod(parse_result.name)
+	pod := p.MocknetTopology.pods[parse_result.name]
+	if p.Is_Local(pod.name) {
+		p.Log.Warningln("received a restart signal fo pod", parse_result.name)
+		p.Log.Infoln("start to reconfig pod", parse_result.name)
+		//p.PodConfig[pod.name].Lock()
+		//p.Log.Infoln(parse_result.name, "has got the lock of PodConfig")
+		p.Clear_Completed_Config(*pod)
+		if p.Completed_Config(*pod) {
+			p.Set_Connection(*pod)
+		}
+	}
+
+	return nil
+}*/
+
+func (p *Plugin) Clear_Completed_Config(pod Pod) error {
+	/*id := p.get_socket_id(pod.name) + 1
+	p.Vpp.DeleteSocket(uint32(id))*/
+
+	p.Log.Infoln("deleting host-side memif interface for pod", pod.name)
+	for _, vpp_id := range pod.infs {
+		memif_int_id := p.IntToVppId.List[pod.name+"-"+strconv.Itoa(vpp_id)]
+		p.Vpp.Delete_Memif_Interface(memif_int_id)
+	}
+
+	return nil
+}
+
 func (p *Plugin) Set_Routes() error {
 	for podname, routes := range p.Routes {
-		for _, route := range routes {
-			if p.Is_Local(podname) {
-				p.Vpp.Pod_Add_Route(podname, route)
-			}
+		if p.Is_Local(podname) {
+			p.Vpp.Pod_Add_Route(podname, routes)
 		}
 	}
 	p.Log.Infoln("all routes of fat-tree has been configured")
@@ -1177,7 +1250,7 @@ func (p *Plugin) Connect(link Link) error {
 				p.Vpp.XConnect(intf1_id, intf2_id)
 				wgs[link.pod1].Done()
 				//p.Log.Infoln("debug: ", link.pod1, wgs[link.pod1])
-				//p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
+				p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
 				break
 			}
 		}
@@ -1206,7 +1279,7 @@ func (p *Plugin) Connect(link Link) error {
 		}
 		wgs[link.pod1].Done()
 		//p.Log.Infoln("debug: ", link.pod1, wgs[link.pod1])
-		//p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
+		p.Log.Info("the waitgroup of ", link.pod1, " reduce 1")
 	}
 
 	return nil
@@ -1255,7 +1328,7 @@ func (p *Plugin) get_socket_id(name string) int {
 	panic("error: find the position of local pod name")
 }
 
-func (pod Pod) alloc_interface_id() error {
+func (pod *Pod) alloc_interface_id() error {
 	//fmt.Println("for pod ", pod.name, "infts =", pod.infs)
 	for mininet_name, _ := range pod.infs {
 		translate, err := strconv.Atoi(mininet_name)
@@ -1406,4 +1479,70 @@ func (p *Plugin) pod_vpp_core_bind() error {
 func get_ip_net_24(ip string) string {
 	split_ip := strings.Split(ip, ".")
 	return split_ip[0] + "." + split_ip[1] + "." + split_ip[2] + ".0"
+}
+
+func (p *Plugin) get_fat_tree_port_order(pod1 string, pod2 string) int {
+	pod_number := 0
+	for _, pod := range p.MocknetTopology.pods {
+		if strings.Contains(pod.name, "h") {
+			pod_number++
+		}
+	}
+
+	k := 4
+	for {
+		if k*k*k/4 == pod_number {
+			break
+		} else {
+			k += 2
+		}
+	}
+
+	var dst int
+	flag := false
+	src, err := strconv.Atoi(strings.TrimPrefix(pod1, "s"))
+	if err != nil {
+		panic(err)
+	}
+	if strings.Contains(pod2, "h") {
+		flag = true
+		dst, err = strconv.Atoi(strings.Split(strings.Split(pod2, "s")[0], "h")[1])
+		if err != nil {
+			panic(err)
+		}
+	} else {
+		dst, err = strconv.Atoi(strings.TrimPrefix(pod2, "s"))
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	src -= 1
+	dst -= 1
+	fmt.Println(src, dst)
+
+	if src < k*k/4 {
+		// core
+		return (dst - k*k/4) / k
+	} else {
+		if (src+1)%2 != (k*k/4)%2 {
+			// aggregation
+			if dst < k*k/4 {
+				// dst is core
+				return k/2 + dst%(k/2)
+			} else {
+				// dst is access
+				return ((dst - k*k/4) % k) / 2
+			}
+		} else {
+			// access
+			if flag {
+				// dst is host
+				return dst
+			} else {
+				// dst is aggregation
+				return k/2 + ((dst-k*k/4)%k)/2
+			}
+		}
+	}
 }

@@ -33,8 +33,11 @@ import (
 	//"git.fd.io/govpp.git/binapi/memif"
 
 	//"git.fd.io/govpp.git/binapi/vxlan"
+	arp_2009 "mocknet/binapi/vpp2009/arp"
+	ip_types_2009 "mocknet/binapi/vpp2009/ip_types"
 	l2_2009 "mocknet/binapi/vpp2009/l2"
 	tap_2009 "mocknet/binapi/vpp2009/tapv2"
+	arp_2110 "mocknet/binapi/vpp2110/arp"
 	fib_types_2110 "mocknet/binapi/vpp2110/fib_types"
 	interfaces_2110 "mocknet/binapi/vpp2110/interface"
 	interface_types_2110 "mocknet/binapi/vpp2110/interface_types"
@@ -46,7 +49,7 @@ import (
 
 var (
 	//sockAddr = flag.String("sock", "/run/vpp/api.sock", "Path to VPP binary API socket file")
-	sockAddr = flag.String("sock", "/var/run/mocknet/h1s2/api.sock", "Path to VPP binary API socket file")
+	sockAddr = flag.String("sock", "/var/run/mocknet/s2/api.sock", "Path to VPP binary API socket file")
 )
 
 func main() {
@@ -85,7 +88,8 @@ func main() {
 	//ipAddressDump(ch)
 
 	//interfaceNotifications(ch)
-	CreateSocket(ch)
+	//CreateSocket(ch)
+	arp_test_2009(ch)
 	//CreateMemifInterface(ch)
 	//interface_state(ch)
 	//create_vxlan_tunnel(ch)
@@ -404,4 +408,44 @@ func Delete_Memif_Interface(ch api.Channel) error {
 
 	fmt.Println("deleted interface id:", 100)
 	return nil
+}
+
+func arp_test_2110(ch api.Channel) {
+	req := &arp_2110.ProxyArpAddDel{
+		IsAdd: true,
+		Proxy: arp_2110.ProxyArp{
+			TableID: 0,
+			Low:     ip_types_2110.IP4Address{10, 1, 0, 1},
+			Hi:      ip_types_2110.IP4Address{10, 2, 0, 1},
+		},
+	}
+
+	reply := &arp_2110.ProxyArpAddDelReply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to set arp proxy")
+		panic(err)
+	}
+
+	fmt.Println("set arp proxy")
+}
+
+func arp_test_2009(ch api.Channel) {
+	req := &arp_2009.ProxyArpAddDel{
+		IsAdd: true,
+		Proxy: arp_2009.ProxyArp{
+			TableID: 0,
+			Low:     ip_types_2009.IP4Address{10, 1, 0, 1},
+			Hi:      ip_types_2009.IP4Address{10, 2, 0, 1},
+		},
+	}
+
+	reply := &arp_2009.ProxyArpAddDelReply{}
+
+	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+		fmt.Println("failed to set arp proxy")
+		panic(err)
+	}
+
+	fmt.Println("set arp proxy")
 }

@@ -26,10 +26,12 @@ import (
 	tap_2110 "mocknet/binapi/vpp2110/tapv2"
 	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
 
+	ethernet_types_2009 "mocknet/binapi/vpp2009/ethernet_types"
 	fib_types_2009 "mocknet/binapi/vpp2009/fib_types"
 	interfaces_2009 "mocknet/binapi/vpp2009/interface"
 	interface_types_2009 "mocknet/binapi/vpp2009/interface_types"
 	ip_2009 "mocknet/binapi/vpp2009/ip"
+	ip_neighbor_2009 "mocknet/binapi/vpp2009/ip_neighbor"
 	ip_types_2009 "mocknet/binapi/vpp2009/ip_types"
 	l2_2009 "mocknet/binapi/vpp2009/l2"
 	memif_2009 "mocknet/binapi/vpp2009/memif"
@@ -713,7 +715,7 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
 			ip_types_2110.Prefix{
 				Address: ip_types_2110.Address{
 					Af: 0,
-					Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(ip.parse_ipv4_address())),
+					Un: ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(parse_ipv4_address(ip.Ip))),
 				},
 				Len: uint8(ip.Mask),
 			},
@@ -752,6 +754,55 @@ func (p *Plugin) Set_Interface_Ip(int_id uint32, ip IpNet) ProcessResult {
 			}
 			ch.Close()
 			p.Log.Infoln("set interface address")
+			return Success
+		}
+		time.Sleep(RETRY_TIME_INTERVAL)
+		count += 1
+	}
+}
+
+func (p *Plugin) Pod_Set_Interface_Ip(pod_name string, int_id uint32, ip IpNet) ProcessResult {
+	req := &interfaces_2009.SwInterfaceAddDelAddress{
+		SwIfIndex: interface_types_2009.InterfaceIndex(int_id),
+		IsAdd:     true,
+		Prefix: ip_types_2009.AddressWithPrefix(
+			ip_types_2009.Prefix{
+				Address: ip_types_2009.Address{
+					Af: 0,
+					Un: ip_types_2009.AddressUnionIP4(ip_types_2009.IP4Address(parse_ipv4_address(ip.Ip))),
+				},
+				Len: uint8(ip.Mask),
+			},
+		),
+	}
+	reply := &interfaces_2009.SwInterfaceAddDelAddressReply{}
+
+	count := 0
+	for {
+		conn := p.connect_to_pod_vpp(pod_name)
+		ch, err := conn.NewAPIChannel()
+
+		if err != nil {
+			p.Log.Errorln("error when connect to pod vpp")
+			panic(err)
+		}
+
+		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
+			ch.Close()
+			p.Log.Warningln("failed to set interface address for pod", pod_name, ", retrying", err)
+			if count >= MAX_RETRY_TIMES {
+				p.Log.Errorln("max retry times up to set interface address for pod", pod_name, ",")
+				return TimesOver
+			}
+		} else {
+			if !KEEP_CONNECTION {
+				conn.Disconnect()
+			}
+			ch.Close()
+			p.Log.Infoln("set interface address for pod", pod_name)
 			return Success
 		}
 		time.Sleep(RETRY_TIME_INTERVAL)
@@ -833,8 +884,9 @@ func (p *Plugin) Pod_Create_Tap(pod_name string) (ProcessResult, uint32) {
 }
 
 type Route_Info struct {
-	Dst IpNet
-	Gw  IpNet
+	Dst  IpNet
+	Gw   IpNet
+	Port uint32
 	// Dev and DevId are always synchronously be set or empty
 	Dev string
 	// Dev and DevId are always synchronously be set or empty
@@ -847,8 +899,8 @@ type IpNet struct {
 	Mask uint
 }
 
-func (ip IpNet) parse_ipv4_address() [4]uint8 {
-	ip_addr := strings.Split(ip.Ip, ".")
+func parse_ipv4_address(ipv4 string) [4]uint8 {
+	ip_addr := strings.Split(ipv4, ".")
 	ip_addr_slice := make([]uint8, 4)
 	for i := 0; i < 4; i++ {
 		conv, err := strconv.Atoi(ip_addr[i])
@@ -876,7 +928,7 @@ func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 
 	if route.Gw.Ip != "" {
 		fibPath.Nh = fib_types_2110.FibPathNh{
-			Address:            ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(route.Gw.parse_ipv4_address())),
+			Address:            ip_types_2110.AddressUnionIP4(ip_types_2110.IP4Address(parse_ipv4_address(route.Gw.Ip))),
 			ClassifyTableIndex: ClassifyTableIndexUnset,
 		}
 		fibPath.Proto = fib_types_2110.FIB_API_PATH_NH_PROTO_IP4
@@ -885,7 +937,7 @@ func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 	prefix := ip_types_2110.Prefix{
 		Address: ip_types_2110.Address{
 			Af: ip_types_2110.ADDRESS_IP4,
-			Un: ip_types_2110.AddressUnionIP4(route.Dst.parse_ipv4_address()),
+			Un: ip_types_2110.AddressUnionIP4(parse_ipv4_address(route.Dst.Ip)),
 		},
 		Len: uint8(route.Dst.Mask),
 	}
@@ -927,7 +979,7 @@ func (p *Plugin) Add_Route(route Route_Info) ProcessResult {
 	return Success
 }
 
-func (p *Plugin) Pod_Add_Route(pod_name string, route Route_Info) ProcessResult {
+func (p *Plugin) Pod_Add_Route(pod_name string, routes []Route_Info) ProcessResult {
 	conn := p.connect_to_pod_vpp(pod_name)
 	ch, err := conn.NewAPIChannel()
 
@@ -936,60 +988,104 @@ func (p *Plugin) Pod_Add_Route(pod_name string, route Route_Info) ProcessResult 
 		return TimesOver
 	}
 
-	req := &ip_2009.IPRouteAddDel{
-		// Multi path is always true
-		IsMultipath: true,
-		IsAdd:       true,
-	}
-
-	fibPath := fib_types_2009.FibPath{}
-
-	if route.Gw.Ip != "" {
-		fibPath.Nh = fib_types_2009.FibPathNh{
-			Address:            ip_types_2009.AddressUnionIP4(ip_types_2009.IP4Address(route.Gw.parse_ipv4_address())),
-			ClassifyTableIndex: ClassifyTableIndexUnset,
+	for _, route := range routes {
+		req := &ip_2009.IPRouteAddDel{
+			// Multi path is always true
+			IsMultipath: true,
+			IsAdd:       true,
 		}
-		fibPath.Proto = fib_types_2009.FIB_API_PATH_NH_PROTO_IP4
-	}
 
-	prefix := ip_types_2009.Prefix{
-		Address: ip_types_2009.Address{
-			Af: ip_types_2009.ADDRESS_IP4,
-			Un: ip_types_2009.AddressUnionIP4(route.Dst.parse_ipv4_address()),
-		},
-		Len: uint8(route.Dst.Mask),
-	}
+		fibPath := fib_types_2009.FibPath{}
 
-	if route.Dev != "" {
-		fibPath.SwIfIndex = route.DevId
-	}
+		if route.Gw.Ip != "" {
+			fibPath.Nh = fib_types_2009.FibPathNh{
+				Address:            ip_types_2009.AddressUnionIP4(ip_types_2009.IP4Address(parse_ipv4_address(route.Gw.Ip))),
+				ClassifyTableIndex: ClassifyTableIndexUnset,
+			}
+			fibPath.Proto = fib_types_2009.FIB_API_PATH_NH_PROTO_IP4
+		}
 
-	req.Route = ip_2009.IPRoute{
-		Prefix: prefix,
-		NPaths: 1,
-		Paths:  []fib_types_2009.FibPath{fibPath},
-	}
+		prefix := ip_types_2009.Prefix{
+			Address: ip_types_2009.Address{
+				Af: ip_types_2009.ADDRESS_IP4,
+				Un: ip_types_2009.AddressUnionIP4(parse_ipv4_address(route.Dst.Ip)),
+			},
+			Len: uint8(route.Dst.Mask),
+		}
 
-	reply := &ip_2009.IPRouteAddDelReply{}
+		if route.Dev != "" {
+			fibPath.SwIfIndex = route.DevId
+		}
 
-	count := 0
-	for {
+		req.Route = ip_2009.IPRoute{
+			Prefix: prefix,
+			NPaths: 1,
+			Paths:  []fib_types_2009.FibPath{fibPath},
+		}
+
+		reply := &ip_2009.IPRouteAddDelReply{}
+
 		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 			conn.Disconnect()
 			ch.Close()
 			p.Log.Warningln("failed to add ip route for pod", pod_name, "err:", err)
-			if count >= MAX_RETRY_TIMES {
-				p.Log.Errorln("max retry times up to add ip route for pod", pod_name, ", imply pod has been restarted, skip for now")
-				return TimesOver
-			}
-		} else {
+			return TimesOver
+		}
+	}
+
+	conn.Disconnect()
+	ch.Close()
+	p.Log.Infoln("added ip route for pod", pod_name)
+	return Success
+}
+
+type ARP struct {
+	Int_id uint
+	Ip     string
+	Mac    string
+}
+
+func (p *Plugin) Pod_Set_Static_ARP(pod_name string, arps []ARP) ProcessResult {
+	//p.Log.Infoln(arps)
+	flag := true
+	conn := p.connect_to_pod_vpp(pod_name)
+	ch, err := conn.NewAPIChannel()
+	if err != nil {
+		conn.Disconnect()
+		ch.Close()
+		p.Log.Errorln("failed to connect to vpp of pod", pod_name)
+		return TimesOver
+	}
+	for _, arp := range arps {
+		req := &ip_neighbor_2009.IPNeighborAddDel{
+			IsAdd: true,
+			Neighbor: ip_neighbor_2009.IPNeighbor{
+				SwIfIndex:  interface_types_2009.InterfaceIndex(arp.Int_id),
+				MacAddress: ethernet_types_2009.MacAddress(p.string_to_MAC(arp.Mac)),
+				IPAddress: ip_types_2009.Address{
+					Af: ip_types_2009.ADDRESS_IP4,
+					Un: ip_types_2009.AddressUnionIP4(parse_ipv4_address(arp.Ip)),
+				},
+			},
+		}
+		reply := &ip_neighbor_2009.IPNeighborAddDelReply{}
+
+		if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
 			conn.Disconnect()
 			ch.Close()
-			p.Log.Infoln("added ip route for pod", pod_name)
-			return Success
+			flag = false
+			break
 		}
-		time.Sleep(RETRY_TIME_INTERVAL)
-		count += 1
+		//p.Log.Infoln("added pod static arp for", pod_name, "ip =", arp.Ip, "intid =", arp.Int_id, "mac =", arp.Mac)
+	}
+	if flag {
+		conn.Disconnect()
+		ch.Close()
+		p.Log.Infoln("added pod static arp for", pod_name)
+		return Success
+	} else {
+		p.Log.Errorln("failed to add pod tap static arp for ", pod_name)
+		return TimesOver
 	}
 }
 
@@ -1021,4 +1117,36 @@ func (p *Plugin) connect_to_main_vpp() *core.Connection {
 	}
 
 	return conn
+}
+
+func (p *Plugin) string_to_MAC(str string) [6]uint8 {
+	mac_addr := [6]uint8{}
+	strs := strings.Split(str, ":")
+	for i, addr := range strs {
+		high_byte := []byte(addr)[0]
+		low_byte := []byte(addr)[1]
+
+		total := 0
+		if high_byte >= 48 && high_byte <= 57 {
+			// ascii 0-9
+			total += 16 * (int(high_byte) - 48)
+		} else if high_byte >= 97 && high_byte <= 102 {
+			// ascii a-f
+			total += 16 * (int(high_byte) - 97 + 10)
+		} else {
+			p.Log.Println("error! the input mac addr is not Hexadecimal (16)")
+		}
+
+		if low_byte >= 48 && low_byte <= 57 {
+			// ascii 0-9
+			total += (int(low_byte) - 48)
+		} else if low_byte >= 97 && low_byte <= 102 {
+			// ascii a-f
+			total += (int(low_byte) - 97 + 10)
+		} else {
+			p.Log.Println("error! the input mac addr is not Hexadecimal (16)")
+		}
+		mac_addr[i] = uint8(total)
+	}
+	return mac_addr
 }

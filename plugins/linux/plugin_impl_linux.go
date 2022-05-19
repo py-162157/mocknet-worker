@@ -215,10 +215,10 @@ func (p *Plugin) Pod_Add_Route(container_id string, pod_name string, route ...Ro
 	}
 }
 
-func (p *Plugin) Pod_Set_Ip(container_id string, pod_name string, ip string) ProcessResult {
+func (p *Plugin) Pod_Set_Ip(container_id string, pod_name string, ip string, masklen string) ProcessResult {
 	var stderr bytes.Buffer
 	cpip := strings.Split(ip, ".") // conrol plane ip
-	data_plane_ip := "10.1." + cpip[2] + "." + cpip[3] + "/16"
+	data_plane_ip := "10.1." + cpip[2] + "." + cpip[3] + masklen
 	cmd := exec.Command("docker", "exec", container_id, "ip", "addr", "add", "dev", "tap0", data_plane_ip)
 	cmd.Stderr = &stderr
 
@@ -244,7 +244,7 @@ func (p *Plugin) Set_Receiver(container_id string, pod_name string) ProcessResul
 	var stderr bytes.Buffer
 	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-s")
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err := cmd.Start()
 	if err == nil {
 		p.Log.Infoln("set iperf3 server for pod", pod_name)
 		return Success
@@ -254,17 +254,19 @@ func (p *Plugin) Set_Receiver(container_id string, pod_name string) ProcessResul
 	}
 }
 
-func (p *Plugin) Set_Sender(container_id string, pod_name string, dst_ip string) ProcessResult {
+func (p *Plugin) Set_Sender(container_id string, pod_name string, dst_ip string) (ProcessResult, string) {
+	p.Log.Infoln("for pod", pod_name, "sender command is ", "docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "10")
 	var stderr bytes.Buffer
-	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "100")
+	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "10")
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+
+	output, err := cmd.Output()
 	if err == nil {
 		p.Log.Infoln("start iperf3 client for pod", pod_name)
-		return Success
+		return Success, string(output)
 	} else {
 		p.Log.Errorln("failed to start iperf3 client for pod", pod_name, "err:", stderr.String())
-		return Failed
+		return Failed, "failed"
 	}
 }
 
