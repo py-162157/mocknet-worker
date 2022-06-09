@@ -66,10 +66,10 @@ type Deps struct {
 	PodType           map[string]string           // for fat-tree bin test, mark host as sender or receiver
 	PodPair           map[string]string           // pod pair for test (sender-receiver)
 	TopologyType      string                      // fat-tree or other
-	PodIntToVppId     PodIntToVppIdSync           // for pod, key: interface name (podname-interfaceid), value: interface id in host-side vpp
+	PodIntToVppId     PodIntToVppIdSync           // for pod, key: interface name (podname-interfaceid), value: memif interface id in pod-side vpp
 	Routes            map[string][]vpp.Route_Info // route for all pods
-	WaitGroups        map[string]sync.WaitGroup
-	FatTreeRouteOrder map[string]map[int]int // key: the order of switches' ports, value: the memif id of these ports
+	FatTreeRouteOrder map[string]map[int]int      // key: the order of switches' ports, value: the memif id of these ports
+	RoutePath         map[string]string           // pod-to-pod route path
 
 	Log logging.PluginLogger
 }
@@ -206,6 +206,7 @@ func (p *Plugin) Init() error {
 	p.TopologyType = "other"
 	wgs["main"] = &sync.WaitGroup{}
 	p.FatTreeRouteOrder = make(map[string]map[int]int)
+	p.RoutePath = make(map[string]string)
 
 	// connect to master-etcd client
 	config := clientv3.Config{
@@ -271,6 +272,16 @@ func (p *Plugin) Close() error {
 func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 	fat_tree_routes := make(map[string][]vpp.Route_Info)
 
+	pod_id_to_intf := make(map[string]string)
+	for podintf, intf_id := range p.PodIntToVppId.List {
+		podname := strings.Split(podintf, "-")[0]
+		pod_id_to_intf[podname+"-"+strconv.Itoa(int(intf_id))] = podintf
+	}
+	podintf_to_dstname := make(map[string]string)
+	for _, link := range p.MocknetTopology.links {
+		podintf_to_dstname[link.pod1+"-"+link.pod1inf] = link.pod2
+	}
+
 	host_numbers := 0
 	for podname, _ := range p.PodSet {
 		if strings.Contains(podname, "h") {
@@ -285,7 +296,7 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 		k += 2
 	}
 
-	cores := make([]string, k)
+	cores := make([]string, k*k/4)
 	aggregations := make([]string, k*k/2)
 	accesses := make([]string, k*k/2)
 	hosts := make([]string, k*k*k/4)
@@ -320,7 +331,7 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 			if err != nil {
 				panic(err)
 			}
-			fmt.Println("s =", s, "k =", k, "h =", h)
+			//fmt.Println("s =", s, "k =", k, "h =", h)
 			hosts[((s-k*k/4)/2-1)*(k/2)+h-1] = podname
 		}
 	}
@@ -340,15 +351,18 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 				if !ok {
 					p.Log.Warningln("devid for ", core_name+"-"+strconv.Itoa(port), "not exist")
 				}
+				devid := uint32(p.FatTreeRouteOrder[core_name][port])
 				fat_tree_routes[core_name] = append(fat_tree_routes[core_name], vpp.Route_Info{
 					Dst: vpp.IpNet{
 						Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr, // now maybe not received, so take replace by DstName domain
 						Mask: 32,
 					},
-					Dev:     "memif0/" + strconv.Itoa(port),
-					DevId:   uint32(p.FatTreeRouteOrder[core_name][port]),
-					DstName: host_name, // read DstIp by DstName after received the pod's ip address
-					Port:    uint32(port),
+					Dev:           "memif0/" + strconv.Itoa(port),
+					DevId:         devid,
+					DstName:       host_name, // read DstIp by DstName after received the pod's ip address
+					Local:         true,
+					Port:          uint32(port),
+					Next_hop_name: podintf_to_dstname[pod_id_to_intf[core_name+"-"+strconv.Itoa(int(devid))]],
 				})
 			}
 		}
@@ -368,33 +382,39 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					if !ok {
 						p.Log.Warningln("devid for ", aggregation_name+"-"+strconv.Itoa(port), "not exist")
 					}
+					devid := uint32(p.FatTreeRouteOrder[aggregation_name][port])
 					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
 							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
-						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   uint32(p.FatTreeRouteOrder[aggregation_name][port]),
-						DstName: host_name,
-						Port:    uint32(port),
+						Dev:           "memif0/" + strconv.Itoa(port),
+						DevId:         devid,
+						DstName:       host_name,
+						Local:         true,
+						Port:          uint32(port),
+						Next_hop_name: podintf_to_dstname[pod_id_to_intf[aggregation_name+"-"+strconv.Itoa(int(devid))]],
 					})
 				} else {
 					// else, up forward the package
 					// find out which core switch to forward
-					port := host_index/(k*k/2) + k/2
+					port := (host_index%(k*k/2))/k + k/2
 					_, ok := p.PodIntToVppId.List[aggregation_name+"-"+strconv.Itoa(port)]
 					if !ok {
 						p.Log.Warningln("devid for ", aggregation_name+"-"+strconv.Itoa(port), "not exist")
 					}
+					devid := uint32(p.FatTreeRouteOrder[aggregation_name][port])
 					fat_tree_routes[aggregation_name] = append(fat_tree_routes[aggregation_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
 							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
-						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   uint32(p.FatTreeRouteOrder[aggregation_name][port]),
-						DstName: host_name,
-						Port:    uint32(port),
+						Dev:           "memif0/" + strconv.Itoa(port),
+						DevId:         devid,
+						DstName:       host_name,
+						Local:         true,
+						Port:          uint32(port),
+						Next_hop_name: podintf_to_dstname[pod_id_to_intf[aggregation_name+"-"+strconv.Itoa(int(devid))]],
 					})
 				}
 			}
@@ -414,15 +434,18 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					if !ok {
 						p.Log.Warningln("devid for ", access_name+"-"+strconv.Itoa(port), "not exist")
 					}
+					devid := uint32(p.FatTreeRouteOrder[access_name][port])
 					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
 							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
-						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   uint32(p.FatTreeRouteOrder[access_name][port]),
-						DstName: host_name,
-						Port:    uint32(port),
+						Dev:           "memif0/" + strconv.Itoa(port),
+						DevId:         devid,
+						DstName:       host_name,
+						Local:         true,
+						Port:          uint32(port),
+						Next_hop_name: podintf_to_dstname[pod_id_to_intf[access_name+"-"+strconv.Itoa(int(devid))]],
 					})
 				} else {
 					// else, up forward teh package
@@ -432,15 +455,18 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 					if !ok {
 						p.Log.Warningln("devid for ", access_name+"-"+strconv.Itoa(port), "not exist")
 					}
+					devid := uint32(p.FatTreeRouteOrder[access_name][port])
 					fat_tree_routes[access_name] = append(fat_tree_routes[access_name], vpp.Route_Info{
 						Dst: vpp.IpNet{
 							Ip:   p.MocknetTopology.pods[host_name].fat_tree_addr,
 							Mask: 32,
 						},
-						Dev:     "memif0/" + strconv.Itoa(port),
-						DevId:   uint32(p.FatTreeRouteOrder[access_name][port]),
-						DstName: host_name,
-						Port:    uint32(port),
+						Dev:           "memif0/" + strconv.Itoa(port),
+						DevId:         devid,
+						DstName:       host_name,
+						Local:         true,
+						Port:          uint32(port),
+						Next_hop_name: podintf_to_dstname[pod_id_to_intf[access_name+"-"+strconv.Itoa(int(devid))]],
 					})
 				}
 			}
@@ -456,6 +482,8 @@ func (p *Plugin) generate_fattree_routes() map[string][]vpp.Route_Info {
 			fmt.Println("dev =", route.Dev)
 			fmt.Println("devid =", route.DevId)
 			fmt.Println("dstname =", route.DstName)
+			fmt.Println("next_hop =", route.Next_hop_name)
+			fmt.Println("local =", route.Local)
 			fmt.Println("-----------------route for", podname, "-----------------")
 		}
 	}*/
@@ -555,6 +583,7 @@ func (p *Plugin) watch_PodType(ctx context.Context) error {
 
 func (p *Plugin) parse_podtype(event clientv3.Event) {
 	// event.Kv.Value: key----/mocknet/podtype/h1s1, value----sender
+	//p.Log.Infoln("debug! podtype =", event)
 	parse_result := strings.Split(string(event.Kv.Value), ",")
 	name_string := parse_result[0]
 	kind_string := parse_result[1]
@@ -645,6 +674,10 @@ func (p *Plugin) watch_receiver_ready(ctx context.Context) error {
 func (p *Plugin) watch_config_state() {
 	wgs["main"].Wait()
 	p.generate_fattree_routes()
+	p.ETCD.Upload_Route(p.Routes)
+	p.ETCD.Wait_for_order("RouteSync")
+	p.Routes = p.ETCD.Parse_Routes()
+
 	for podname, Podinfo := range p.PodInfos.List {
 		if strings.Contains(podname, "h") && p.Is_Local(podname) {
 			mac_addr := p.Linux.Get_MAC_Addr(Podinfo.containerid, podname)
@@ -658,7 +691,50 @@ func (p *Plugin) watch_config_state() {
 	for podname, routes := range p.Routes {
 		RouteMap[podname] = make(map[string]vpp.Route_Info)
 		for _, route := range routes {
-			RouteMap[podname][route.Dst.Ip] = route
+			RouteMap[podname][route.DstName] = route
+		}
+	}
+
+	for srcname, _ := range p.PodInfos.List {
+		if strings.Contains(srcname, "h") {
+			for dstname, _ := range p.PodInfos.List {
+				if strings.Contains(dstname, "h") && dstname != srcname {
+					access := "s" + strings.Split(srcname, "s")[1]
+					path := srcname + "--" + access
+					nexthop := access
+					for {
+						//p.Log.Infoln("srcname =", srcname, ", dstname =", dstname, ", present hop =", nexthop, ", next hop =", RouteMap[nexthop][dstname].Next_hop_name, ", path =", path)
+						if nexthop == RouteMap[nexthop][dstname].Next_hop_name {
+							p.Log.Errorln("the present and next hop is same!")
+							break
+						}
+						nexthop = RouteMap[nexthop][dstname].Next_hop_name
+						path += "--" + nexthop
+						if nexthop == dstname {
+							break
+						}
+					}
+
+					p.RoutePath[srcname+"-"+dstname] = path
+				}
+			}
+		}
+	}
+
+	path_count := make(map[string]int)
+	for sender, receiver := range p.PodPair {
+		if p.PodType[sender] == "sender" {
+			path := p.RoutePath[sender+"-"+receiver]
+			split_path := strings.Split(path, "--")
+			for _, pod := range split_path {
+				path_count[pod] = path_count[pod] + 1
+			}
+		}
+	}
+
+	for pod, count := range path_count {
+		if !strings.Contains(pod, "h") {
+			p.Log.Infoln("switch", pod, "have ", count, " link pass through")
 		}
 	}
 
@@ -676,6 +752,7 @@ func (p *Plugin) watch_config_state() {
 		podname := strings.Split(string(kv.Key), "/")[3]
 		//p.Log.Infoln("podname =", podname)
 		mac_addr := string(kv.Value)
+		dst_name := p.MocknetTopology.pods[podname].name
 		dst_ip := p.MocknetTopology.pods[podname].fat_tree_addr
 
 		LinuxARPs[podname] = linux.ARP{
@@ -686,7 +763,7 @@ func (p *Plugin) watch_config_state() {
 
 		for _, swname := range swnames {
 			VppARPs[swname] = append(VppARPs[swname], vpp.ARP{
-				Int_id: uint(RouteMap[swname][dst_ip].DevId),
+				Int_id: uint(RouteMap[swname][dst_name].DevId),
 				Ip:     dst_ip,
 				Mac:    mac_addr,
 			})
@@ -714,6 +791,9 @@ func (p *Plugin) watch_config_state() {
 		if p.Is_Local(podname) {
 			if strings.Contains(podname, "h") {
 				go p.Linux.Set_Static_ARP(p.PodInfos.List[podname].containerid, podname, LinuxARPs)
+				// for now only write destination static arp
+				//dst_arp := LinuxARPs[p.PodPair[podname]]
+				//go p.Linux.Set_Static_ARP_Single(p.PodInfos.List[podname].containerid, podname, dst_arp)
 			} else {
 				// Set ip address for switch interface
 				for id, addr := range IntfAddrMap[podname] {
@@ -734,16 +814,17 @@ func (p *Plugin) watch_config_state() {
 
 func (p *Plugin) get_receiver_ready() {
 	flag := true
-	p.Log.Infoln("debug!! localpod =", p.LocalPods)
 	p.Log.Infoln("debug!! podtype =", p.PodType)
-	p.Log.Infoln("debug!! podpair =", p.PodPair)
+	for pod1, pod2 := range p.PodPair {
+		p.Log.Infoln("podpair pod1 =", pod1, ", pod2 =", pod2)
+	}
 	for _, podname := range p.LocalPods {
-		p.Log.Infoln("pod", podname, "is local")
+		//p.Log.Infoln("pod", podname, "is local")
 		if p.PodType[podname] == "receiver" {
-			p.Log.Infoln("pod", podname, "is local and receiver")
+			//p.Log.Infoln("pod", podname, "is local and receiver")
 			containerid := p.PodInfos.List[podname].containerid
 			result := p.Linux.Set_Receiver(containerid, podname)
-			p.Log.Infoln("for pod", podname, "receiver ready result =", result)
+			//p.Log.Infoln("for pod", podname, "receiver ready result =", result)
 			if result != linux.Success {
 				// cann't set iperf3 server for all local receiver
 				flag = false
@@ -755,6 +836,11 @@ func (p *Plugin) get_receiver_ready() {
 	}
 }
 
+type TempSpeedCount struct {
+	lock *sync.Mutex
+	list map[string]float64
+}
+
 func (p *Plugin) watch_test_command(ctx context.Context) error {
 	for {
 		resp, err := p.MasterEtcdClient.Get(context.Background(), "/mocknet/command/FullTest")
@@ -763,14 +849,49 @@ func (p *Plugin) watch_test_command(ctx context.Context) error {
 		} else {
 			if len(resp.Kvs) != 0 {
 				if string(resp.Kvs[0].Value) == "true" {
+					var count int
+					for _, podname := range p.LocalPods {
+						if p.PodType[podname] == "sender" {
+							count++
+						}
+					}
+					wgs["test"] = &sync.WaitGroup{}
+					wgs["test"].Add(count)
+					speed_count := TempSpeedCount{
+						lock: &sync.Mutex{},
+						list: make(map[string]float64),
+					}
 					for _, podname := range p.LocalPods {
 						if p.PodType[podname] == "sender" {
 							containerid := p.PodInfos.List[podname].containerid
 							paird_pod := p.PodPair[podname]
 							dst_ip := p.MocknetTopology.pods[paird_pod].fat_tree_addr
-							go p.speedtest(containerid, podname, dst_ip)
+							go p.speedtest(speed_count, containerid, podname, dst_ip, paird_pod)
 						}
 					}
+					wgs["test"].Wait()
+
+					p.Log.Println("*********************")
+
+					p.ETCD.Upload_Speed(speed_count.list)
+					p.ETCD.Inform_finished("SpeedUpload")
+					p.ETCD.Wait_for_order("SpeedDownload")
+					speed_map := p.ETCD.Parse_Speed()
+
+					total_speed := 0
+					for podname, speed := range speed_map {
+						if strings.Contains(podname, "h") {
+							p.Log.Println("host", podname, "speed =", speed)
+							total_speed += int(speed)
+						}
+					}
+					for podname, speed := range speed_map {
+						if !strings.Contains(podname, "h") {
+							p.Log.Println("switch", podname, "speed =", speed)
+						}
+					}
+
+					p.Log.Infoln("total speed =", total_speed/2)
 					break
 				}
 			}
@@ -779,11 +900,65 @@ func (p *Plugin) watch_test_command(ctx context.Context) error {
 	return nil
 }
 
-func (p *Plugin) speedtest(container_id string, pod_name string, dst_ip string) {
+func (p *Plugin) speedtest(speed_count TempSpeedCount, container_id string, pod_name string, dst_ip string, dst_name string) {
 	_, output := p.Linux.Set_Sender(container_id, pod_name, dst_ip)
-	p.Log.Infoln("------------------- output of pod", pod_name, "-------------------")
-	p.Log.Infoln(strings.Split(output, "- - - - - - - - - - - - - - - - - - - - - - - - -")[1])
-	p.Log.Infoln("------------------- output of pod", pod_name, "-------------------")
+	fmt.Println("------------------- output of pod", pod_name, "-------------------")
+	path := p.RoutePath[pod_name+"-"+dst_name]
+	fmt.Println("path is ", path)
+	key_output := strings.Split(output, "- - - - - - - - - - - - - - - - - - - - - - - - -")[1]
+	//fmt.Println(key_output)
+
+	var speed_string string
+	var scale string
+	split_str := strings.Split(key_output, " ")
+	count := 0
+	for i, a := range split_str {
+		if strings.Contains(a, "bits/sec") {
+			count++
+			// count = 1 means send rate, and 2 means receive rate
+			if count == 2 {
+				speed_string = split_str[i-1]
+				scale = split_str[i]
+				break
+			}
+		}
+	}
+
+	fmt.Println("speed_string =", speed_string, "scale =", scale)
+
+	if scale == "Gbits/sec" {
+		speed, err := strconv.ParseFloat(speed_string, 64)
+		if err != nil {
+			panic(err)
+		}
+		speed *= 1024
+		speed_count.lock.Lock()
+		path_string := strings.Split(path, "--")
+		for _, podname := range path_string {
+			if _, ok := speed_count.list[podname]; !ok {
+				speed_count.list[podname] = 0
+			}
+			speed_count.list[podname] += speed
+		}
+		speed_count.lock.Unlock()
+		wgs["test"].Done()
+	} else if scale == "Mbits/sec" {
+		speed, err := strconv.ParseFloat(speed_string, 64)
+		if err != nil {
+			panic(err)
+		}
+		speed_count.lock.Lock()
+		path_string := strings.Split(path, "--")
+		for _, podname := range path_string {
+			if _, ok := speed_count.list[podname]; !ok {
+				speed_count.list[podname] = 0
+			}
+			speed_count.list[podname] += speed
+		}
+		speed_count.lock.Unlock()
+		wgs["test"].Done()
+	}
+	fmt.Println("------------------- output of pod", pod_name, "-------------------")
 }
 
 func (p *Plugin) parse_assignment(event clientv3.Event) {
@@ -1519,7 +1694,7 @@ func (p *Plugin) get_fat_tree_port_order(pod1 string, pod2 string) int {
 
 	src -= 1
 	dst -= 1
-	fmt.Println(src, dst)
+	//fmt.Println(src, dst)
 
 	if src < k*k/4 {
 		// core

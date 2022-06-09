@@ -2,7 +2,11 @@ package etcd
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"time"
+
+	"mocknet/plugins/vpp"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.ligato.io/cn-infra/v2/logging"
@@ -105,7 +109,6 @@ func (p *Plugin) Wait_for_order(order string) error {
 func (p *Plugin) Put(key string, value string) error {
 	kv := clientv3.NewKV(p.EtcdClient)
 	kv.Put(context.Background(), key, value)
-	p.Log.Infoln("put a data to etcd")
 	return nil
 }
 
@@ -122,4 +125,109 @@ func (p *Plugin) Get(key string, With_Prefix bool) *clientv3.GetResponse {
 		panic(err)
 	}
 	return resp
+}
+
+func (p *Plugin) Upload_Route(routes_map map[string][]vpp.Route_Info) {
+	for src, routes := range routes_map {
+		for _, route := range routes {
+			key := "/mocknet/routes/" + src + "-" + route.DstName
+			value := "Src:" + src + ","
+			value += "DstIp:" + route.Dst.Ip + ","
+			value += "DstMask:" + strconv.Itoa(int(route.Dst.Mask)) + ","
+			value += "GwIp:" + route.Gw.Ip + ","
+			value += "GwMask:" + strconv.Itoa(int(route.Gw.Mask)) + ","
+			value += "Port:" + strconv.Itoa(int(route.Port)) + ","
+			value += "Dev:" + route.Dev + ","
+			value += "Devid:" + strconv.Itoa(int(route.DevId)) + ","
+			value += "DstName:" + route.DstName + ","
+			value += "NextHopName:" + route.Next_hop_name + ","
+			value += "LocalHostName:" + p.LocalHostName
+
+			p.Put(key, value)
+		}
+	}
+
+	p.Inform_finished("RouteUpload")
+}
+
+func (p *Plugin) Upload_Speed(speed_map map[string]float64) {
+	for pod, speed := range speed_map {
+		key := "/mocknet/speed/" + pod + "/" + p.LocalHostName
+		value := "pod:" + pod + "," + "speed:" + strconv.FormatFloat(speed, 'E', -1, 64)
+		p.Put(key, value)
+	}
+}
+
+func (p *Plugin) Parse_Speed() map[string]float64 {
+	speed_map := make(map[string]float64)
+	resp := p.Get("/mocknet/speed/", true)
+	for _, kv := range resp.Kvs {
+		value := kv.Value
+		split_value := strings.Split(string(value), ",")
+		podname := strings.Split(split_value[0], ":")[1]
+		speed_string := strings.Split(split_value[1], ":")[1]
+		speed, err := strconv.ParseFloat(speed_string, 64)
+		if err != nil {
+			panic(err)
+		}
+		if _, ok := speed_map[podname]; !ok {
+			speed_map[podname] = speed
+		} else {
+			speed_map[podname] += speed
+		}
+	}
+
+	return speed_map
+}
+
+func (p *Plugin) Parse_Routes() map[string][]vpp.Route_Info {
+	routes_map := make(map[string][]vpp.Route_Info)
+	resp := p.Get("/mocknet/routes/", true)
+	for _, kv := range resp.Kvs {
+		//fmt.Println(string(kv.Value))
+		value := kv.Value
+		split_value := strings.Split(string(value), ",")
+		src := strings.Split(split_value[0], ":")[1]
+		dstip := strings.Split(split_value[1], ":")[1]
+		dstmask_string := strings.Split(split_value[2], ":")[1]
+		dstmask, _ := strconv.Atoi(dstmask_string)
+		gwip := strings.Split(split_value[3], ":")[1]
+		gwmask_string := strings.Split(split_value[4], ":")[1]
+		gwmask, _ := strconv.Atoi(gwmask_string)
+		port_string := strings.Split(split_value[5], ":")[1]
+		port, _ := strconv.Atoi(port_string)
+		dev := strings.Split(split_value[6], ":")[1]
+		devid_string := strings.Split(split_value[7], ":")[1]
+		devid, _ := strconv.Atoi(devid_string)
+		dstname := strings.Split(split_value[8], ":")[1]
+		nexthop := strings.Split(split_value[9], ":")[1]
+		hostname := strings.Split(split_value[10], ":")[1]
+		var local bool
+		if hostname == p.LocalHostName {
+			local = true
+		} else {
+			local = false
+		}
+		if _, ok := routes_map[src]; !ok {
+			routes_map[src] = make([]vpp.Route_Info, 0)
+		}
+		routes_map[src] = append(routes_map[src], vpp.Route_Info{
+			Dst: vpp.IpNet{
+				Ip:   dstip,
+				Mask: uint(dstmask),
+			},
+			Gw: vpp.IpNet{
+				Ip:   gwip,
+				Mask: uint(gwmask),
+			},
+			Port:          uint32(port),
+			Dev:           dev,
+			DevId:         uint32(devid),
+			DstName:       dstname,
+			Next_hop_name: nexthop,
+			Local:         local,
+		})
+	}
+
+	return routes_map
 }

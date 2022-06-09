@@ -23,7 +23,6 @@ import (
 	ip_types_2110 "mocknet/binapi/vpp2110/ip_types"
 	l2_2110 "mocknet/binapi/vpp2110/l2"
 	memif_2110 "mocknet/binapi/vpp2110/memif"
-	tap_2110 "mocknet/binapi/vpp2110/tapv2"
 	vxlan_2110 "mocknet/binapi/vpp2110/vxlan"
 
 	ethernet_types_2009 "mocknet/binapi/vpp2009/ethernet_types"
@@ -43,6 +42,11 @@ const (
 	RETRY_TIME_INTERVAL = 1 * time.Second
 	MAX_RETRY_TIMES     = 3
 	KEEP_CONNECTION     = true
+	MEMIF_TX_QX_QUEUES  = 1    // default = 1
+	MEMIF_BUFFER_SIZE   = 0    // default = 0
+	MEMIF_RING_SIZE     = 1024 // default = 1024
+	TAP_NumRxQueues     = 1    // default = 1
+	TAP_TX_QX_RINGSIZE  = 256  //default = 256
 )
 
 var (
@@ -207,6 +211,18 @@ func (p *Plugin) Create_Memif_Interface(role_string string, id uint32, socket_id
 		ID:       id,
 		SocketID: socket_id,
 	}
+	if MEMIF_TX_QX_QUEUES != 1 {
+		req.TxQueues = MEMIF_TX_QX_QUEUES
+		req.RxQueues = MEMIF_TX_QX_QUEUES
+	}
+
+	if MEMIF_RING_SIZE != 1024 {
+		req.RingSize = MEMIF_RING_SIZE
+	}
+
+	if MEMIF_BUFFER_SIZE != 0 {
+		req.BufferSize = MEMIF_BUFFER_SIZE
+	}
 	reply := &memif_2110.MemifCreateReply{}
 
 	count := 0
@@ -306,6 +322,18 @@ func (p *Plugin) Pod_Create_Memif_Interface(pod_name string, role_string string,
 		Role:     role,
 		ID:       id,
 		SocketID: 0,
+	}
+	if MEMIF_TX_QX_QUEUES != 1 {
+		req.TxQueues = MEMIF_TX_QX_QUEUES
+		req.RxQueues = MEMIF_TX_QX_QUEUES
+	}
+
+	if MEMIF_RING_SIZE != 1024 {
+		req.RingSize = MEMIF_RING_SIZE
+	}
+
+	if MEMIF_BUFFER_SIZE != 0 {
+		req.BufferSize = MEMIF_BUFFER_SIZE
 	}
 	reply := &memif_2009.MemifCreateReply{}
 
@@ -810,42 +838,17 @@ func (p *Plugin) Pod_Set_Interface_Ip(pod_name string, int_id uint32, ip IpNet) 
 	}
 }
 
-func (p *Plugin) Create_Tap() ProcessResult {
-	req := &tap_2110.TapCreateV2{
-		ID: 0,
-	}
-	reply := &tap_2110.TapCreateV2Reply{}
-
-	var conn *core.Connection
-	if !KEEP_CONNECTION {
-		conn = p.connect_to_main_vpp()
-	} else {
-		conn = p.conn
-	}
-	ch, err := conn.NewAPIChannel()
-
-	if err != nil {
-		p.Log.Errorln("error when connect to vpp")
-		panic(err)
-	}
-
-	if err := ch.SendRequest(req).ReceiveReply(reply); err != nil {
-		p.Log.Errorln("failed to create host tap interface")
-		return TimesOver
-	}
-
-	if !KEEP_CONNECTION {
-		conn.Disconnect()
-	}
-	ch.Close()
-	p.Log.Infoln("created host tap interface")
-	return Success
-}
-
 func (p *Plugin) Pod_Create_Tap(pod_name string) (ProcessResult, uint32) {
 	req := &tap_2009.TapCreateV2{
 		ID:  0,
 		Tag: "test",
+	}
+	if TAP_TX_QX_RINGSIZE != 256 {
+		req.RxRingSz = TAP_TX_QX_RINGSIZE
+		req.TxRingSz = TAP_TX_QX_RINGSIZE
+	}
+	if TAP_NumRxQueues != 1 {
+		req.NumRxQueues = TAP_NumRxQueues
 	}
 	reply := &tap_2009.TapCreateV2Reply{}
 
@@ -884,14 +887,14 @@ func (p *Plugin) Pod_Create_Tap(pod_name string) (ProcessResult, uint32) {
 }
 
 type Route_Info struct {
-	Dst  IpNet
-	Gw   IpNet
-	Port uint32
-	// Dev and DevId are always synchronously be set or empty
-	Dev string
-	// Dev and DevId are always synchronously be set or empty
-	DevId   uint32
-	DstName string
+	Dst           IpNet
+	Gw            IpNet
+	Port          uint32
+	Dev           string
+	DevId         uint32
+	DstName       string
+	Next_hop_name string
+	Local         bool
 }
 
 type IpNet struct {

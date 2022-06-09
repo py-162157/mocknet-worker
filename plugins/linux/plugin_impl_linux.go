@@ -255,14 +255,14 @@ func (p *Plugin) Set_Receiver(container_id string, pod_name string) ProcessResul
 }
 
 func (p *Plugin) Set_Sender(container_id string, pod_name string, dst_ip string) (ProcessResult, string) {
-	p.Log.Infoln("for pod", pod_name, "sender command is ", "docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "10")
+	p.Log.Infoln("for pod", pod_name, "sender command is ", "docker", "exec", container_id, "iperf3", "-c", dst_ip)
 	var stderr bytes.Buffer
-	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-c", dst_ip, "-b", "0", "-t", "10")
+	cmd := exec.Command("docker", "exec", container_id, "iperf3", "-c", dst_ip)
 	cmd.Stderr = &stderr
 
 	output, err := cmd.Output()
 	if err == nil {
-		p.Log.Infoln("start iperf3 client for pod", pod_name)
+		//p.Log.Infoln("start iperf3 client for pod", pod_name)
 		return Success, string(output)
 	} else {
 		p.Log.Errorln("failed to start iperf3 client for pod", pod_name, "err:", stderr.String())
@@ -314,6 +314,20 @@ func (p *Plugin) Set_Static_ARP(container_id string, pod_name string, podinfos m
 				p.Log.Errorln(err)
 			}
 		}
+	}
+
+	p.Log.Infoln("Static ARP write for pod", pod_name)
+
+	return nil
+}
+
+// set static arp only for paired hosts
+func (p *Plugin) Set_Static_ARP_Single(container_id string, pod_name string, podinfo ARP) error {
+	//p.Log.Infoln("for pod", info.Name, "containerid =", info.ContainerId, "dstip =", info.Ip, "macaddr =", info.Mac)
+	cmd := exec.Command("docker", "exec", container_id, "arp", "-s", podinfo.Ip, podinfo.Mac)
+	err := cmd.Run()
+	if err != nil {
+		p.Log.Errorln(err)
 	}
 
 	p.Log.Infoln("Static ARP write for pod", pod_name)
